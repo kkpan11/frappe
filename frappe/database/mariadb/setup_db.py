@@ -1,14 +1,10 @@
 import os
+import sys
 
 import click
 
 import frappe
 from frappe.database.db_manager import DbManager
-
-REQUIRED_MARIADB_CONFIG = {
-	"character_set_server": "utf8mb4",
-	"collation_server": "utf8mb4_unicode_ci",
-}
 
 
 def get_mariadb_variables():
@@ -23,7 +19,7 @@ def get_mariadb_version(version_string: str = ""):
 	return version.rsplit(".", 1)
 
 
-def setup_database(force, verbose, no_mariadb_socket=False):
+def setup_database(force, verbose, mariadb_user_host_login_scope=None):
 	frappe.local.session = frappe._dict({"user": "Administrator"})
 
 	db_user = frappe.conf.db_user
@@ -31,27 +27,23 @@ def setup_database(force, verbose, no_mariadb_socket=False):
 	root_conn = get_root_connection()
 	dbman = DbManager(root_conn)
 	dbman_kwargs = {}
-	if no_mariadb_socket:
-		dbman_kwargs["host"] = "%"
 
-	if dbman.does_user_exist(db_user):
-		print("User exists", db_user)
-		dbman.set_user_password(db_user, frappe.conf.db_password, **dbman_kwargs)
-		if verbose:
-			print("Re-used existing user %s" % db_user)
-	else:
-		dbman.create_user(db_user, frappe.conf.db_password, **dbman_kwargs)
-		if verbose:
-			print("Created user %s" % db_user)
+	if mariadb_user_host_login_scope is not None:
+		dbman_kwargs["host"] = mariadb_user_host_login_scope
+
+	dbman.create_user(db_user, frappe.conf.db_password, **dbman_kwargs)
+	if verbose:
+		print(f"Created or updated user {db_user}")
 
 	if force or (db_name not in dbman.get_database_list()):
 		dbman.drop_database(db_name)
 	else:
-		raise Exception(f"Database {db_name} already exists")
+		print(f"Database {db_name} already exists, please drop it manually or pass `--force`.")
+		sys.exit(1)
 
 	dbman.create_database(db_name)
 	if verbose:
-		print("Created database %s" % db_name)
+		print("Created database {}".format(db_name))
 
 	dbman.grant_all_privileges(db_name, db_user, **dbman_kwargs)
 	dbman.flush_privileges()
@@ -73,26 +65,22 @@ def drop_user_and_database(
 	dbman.delete_user(db_user)
 
 
-def bootstrap_database(db_name, verbose, source_sql=None):
+def bootstrap_database(verbose, source_sql=None):
 	import sys
 
-	frappe.connect(db_name=db_name)
-	if not check_database_settings():
-		print("Database settings do not match expected values; stopping database setup.")
-		sys.exit(1)
+	frappe.connect()
+	check_compatible_versions()
 
 	import_db_from_sql(source_sql, verbose)
-	frappe.connect(db_name=db_name)
 
+	frappe.connect()
 	if "tabDefaultValue" not in frappe.db.get_tables(cached=False):
 		from click import secho
 
 		secho(
 			"Table 'tabDefaultValue' missing in the restored site. "
-			"Database not installed correctly, this can due to lack of "
-			"permission, or that the database name exists. Check your mysql"
-			" root password, validity of the backup file or use --force to"
-			" reinstall",
+			"This happens when the backup fails to restore. Please check that the file is valid\n"
+			"Do go through the above output to check the exact error message from MariaDB",
 			fg="red",
 		)
 		sys.exit(1)
@@ -108,34 +96,7 @@ def import_db_from_sql(source_sql=None, verbose=False):
 		verbose, db_name, source_sql, frappe.conf.db_user, frappe.conf.db_password
 	)
 	if verbose:
-		print("Imported from database %s" % source_sql)
-
-
-def check_database_settings():
-	check_compatible_versions()
-
-	# Check each expected value vs. actuals:
-	mariadb_variables = get_mariadb_variables()
-	result = True
-	for key, expected_value in REQUIRED_MARIADB_CONFIG.items():
-		if mariadb_variables.get(key) != expected_value:
-			print(
-				"For key %s. Expected value %s, found value %s"
-				% (key, expected_value, mariadb_variables.get(key))
-			)
-			result = False
-
-	if not result:
-		print(
-			(
-				"{sep2}Creation of your site - {site} failed because MariaDB is not properly {sep}"
-				"configured.{sep2}"
-				"Please verify the above settings in MariaDB's my.cnf.  Restart MariaDB.{sep}"
-				"And then run `bench new-site {site}` again.{sep2}"
-			).format(site=frappe.local.site, sep2="\n\n", sep="\n")
-		)
-
-	return result
+		print("Imported from database {}".format(source_sql))
 
 
 def check_compatible_versions():
@@ -145,12 +106,12 @@ def check_compatible_versions():
 
 		if version_tuple < (10, 6):
 			click.secho(
-				f"Warning: MariaDB version {version} is less than 10.6 which is not supported by Frappe",
+				f"Warning: MariaDB version {version} is older than 10.6 which is not supported by Frappe",
 				fg="yellow",
 			)
-		elif version_tuple >= (10, 9):
+		elif version_tuple > (11, 3):
 			click.secho(
-				f"Warning: MariaDB version {version} is more than 10.8 which is not yet tested with Frappe Framework.",
+				f"Warning: MariaDB version {version} is newer than 11.3 which is not yet tested with Frappe Framework.",
 				fg="yellow",
 			)
 	except Exception:
@@ -162,22 +123,30 @@ def check_compatible_versions():
 
 def get_root_connection():
 	if not frappe.local.flags.root_connection:
+		from getpass import getpass
+
 		if not frappe.flags.root_login:
-			frappe.flags.root_login = "root"
+			frappe.flags.root_login = (
+				frappe.conf.get("mariadb_root_login")
+				or frappe.conf.get("root_login")
+				or (sys.__stdin__.isatty() and input("Enter mysql super user [root]: "))
+				or "root"
+			)
 
 		if not frappe.flags.root_password:
-			frappe.flags.root_password = frappe.conf.get("root_password") or None
-
-		if not frappe.flags.root_password:
-			import getpass
-
-			frappe.flags.root_password = getpass.getpass("MySQL root password: ")
+			frappe.flags.root_password = (
+				frappe.conf.get("mariadb_root_password")
+				or frappe.conf.get("root_password")
+				or getpass("MySQL root password: ")
+			)
 
 		frappe.local.flags.root_connection = frappe.database.get_db(
+			socket=frappe.conf.db_socket,
 			host=frappe.conf.db_host,
 			port=frappe.conf.db_port,
 			user=frappe.flags.root_login,
 			password=frappe.flags.root_password,
+			cur_db_name=None,
 		)
 
 	return frappe.local.flags.root_connection
