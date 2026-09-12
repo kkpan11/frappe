@@ -1,22 +1,20 @@
+import json
 import textwrap
 from collections import defaultdict
 from collections.abc import Generator, Iterable, Mapping, Sequence
 from datetime import date, datetime
 from itertools import groupby
 from operator import attrgetter
-from typing import Any, NamedTuple, TypeAlias, TypeGuard, TypeVar, cast
+from typing import Any, NamedTuple, Self, TypeAlias, TypeGuard, TypeVar, cast, override
 
 from pypika import Column
-from typing_extensions import Self, override
-
-from .docref import DocRef
 
 Doct: TypeAlias = str
 Fld: TypeAlias = str
 Op: TypeAlias = str
 DateTime: TypeAlias = datetime | date
 _Value: TypeAlias = str | int | float | None | DateTime | Column
-_InputValue: TypeAlias = _Value | DocRef | bool
+_InputValue: TypeAlias = _Value | bool
 Value: TypeAlias = _Value | Sequence[_Value]
 InputValue: TypeAlias = _InputValue | Sequence[_InputValue]
 
@@ -38,10 +36,8 @@ class Sentinel:
 
 UNSPECIFIED = Sentinel()
 
-T = TypeVar("T")
 
-
-def is_unspecified(value: T | Sentinel) -> TypeGuard[Sentinel]:
+def is_unspecified[T](value: T | Sentinel) -> TypeGuard[Sentinel]:
 	return value is UNSPECIFIED
 
 
@@ -55,10 +51,8 @@ class _FilterTuple(NamedTuple):
 def _type_narrow(v: _InputValue) -> _Value:
 	if isinstance(v, bool):  # beware: bool derives int in _Value
 		return int(v)
-	elif isinstance(v, _Value):
+	elif isinstance(v, _Value):  # type: ignore[redundant-expr]
 		return v
-	elif isinstance(v, DocRef):  # type: ignore[redundant-expr]
-		return v.__value__()
 	else:
 		raise ValueError(
 			f"Value must be one of types: {', '.join(str(t.__name__) for t in _InputValue.__args__)}; found {type(v)}"
@@ -117,7 +111,11 @@ class FilterTuple(_FilterTuple):
 
 			# soundness
 			if operator in ("in", "not in") and isinstance(value, str):
-				value = value.split(",")
+				try:
+					parsed = json.loads(value)
+					value = parsed if isinstance(parsed, list) else value.split(",")  # type: ignore[assignment]
+				except ValueError:
+					value = value.split(",")
 
 			_value: Value
 			if isinstance(value, _InputValue):
@@ -258,7 +256,7 @@ class Filters(list[FilterTuple]):
 				optimized.extend(filters)
 			else:
 
-				def _values() -> Generator[_Value, None, None]:
+				def _values() -> Generator[_Value]:
 					for f in filters:
 						# f.value is already narrowed to Val when we optimize over fully initialized FilterTuple
 						yield cast(_Value, f.value)  # = operator only is allowed to have _Value
@@ -285,4 +283,4 @@ class Filters(list[FilterTuple]):
 		return f"Filters(\n{filters_str}\n)"
 
 
-FilterSignature: TypeAlias = Filters | FilterTuple | FilterMappingSpec | FilterTupleSpec
+type FilterSignature = Filters | FilterTuple | FilterMappingSpec | FilterTupleSpec

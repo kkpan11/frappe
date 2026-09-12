@@ -63,8 +63,8 @@ export default class Section {
 	make_head() {
 		this.head = $(`
 			<div class="section-head">
-				${__(this.df.label, null, this.df.parent)}
-				<span class="ml-2 collapse-indicator mb-1"></span>
+			${__(this.df.label, null, this.df.parent)}
+			<span class="collapse-indicator"></span>
 			</div>
 		`);
 
@@ -78,8 +78,14 @@ export default class Section {
 			this.collapse_link = this.head.on("click", () => {
 				this.collapse();
 			});
+			const me = this;
+			this.collapse_link.enterKey(function () {
+				me.collapse();
+			});
 			this.set_icon();
 			this.indicator.show();
+			this.head.attr("tabindex", 0);
+			this.indicator.attr("tabindex", 0);
 		}
 	}
 
@@ -114,6 +120,7 @@ export default class Section {
 
 		if (hide === undefined) {
 			hide = !this.body.hasClass("hide");
+			this.expanded_by_user = !hide;
 		}
 
 		this.body.toggleClass("hide", hide);
@@ -129,8 +136,12 @@ export default class Section {
 	}
 
 	set_icon(hide) {
-		let indicator_icon = hide ? "es-line-down" : "es-line-up";
+		let indicator_icon = hide ? "chevron-right" : "chevron-down";
 		this.indicator && this.indicator.html(frappe.utils.icon(indicator_icon, "sm", "mb-1"));
+	}
+
+	set_label(label) {
+		this.wrapper.find(".section-head").html(label);
 	}
 
 	is_collapsed() {

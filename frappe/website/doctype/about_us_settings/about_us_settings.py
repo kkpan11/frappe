@@ -8,6 +8,8 @@ from frappe.model.document import Document
 
 
 class AboutUsSettings(Document):
+	_DOCTYPE_NAME = "About Us Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -22,6 +24,7 @@ class AboutUsSettings(Document):
 		company_history_heading: DF.Data | None
 		company_introduction: DF.TextEditor | None
 		footer: DF.TextEditor | None
+		is_disabled: DF.Check
 		page_title: DF.Data | None
 		team_members: DF.Table[AboutUsTeamMember]
 		team_members_heading: DF.Data | None

@@ -33,6 +33,8 @@ class ClientSecretNotSetError(frappe.ValidationError):
 
 
 class SocialLoginKey(Document):
+	_DOCTYPE_NAME = "Social Login Key"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -54,6 +56,7 @@ class SocialLoginKey(Document):
 		icon: DF.Data | None
 		provider_name: DF.Data
 		redirect_url: DF.Data | None
+		show_in_resource_metadata: DF.Check
 		sign_ups: DF.Literal["", "Allow", "Deny"]
 		social_login_provider: DF.Literal[
 			"Custom",
@@ -66,6 +69,9 @@ class SocialLoginKey(Document):
 			"fairlogin",
 			"Keycloak",
 		]
+		tenant_id: DF.Data | None
+		trust_any_tenant: DF.Check
+		trust_email_without_verified_claim: DF.Check
 		user_id_property: DF.Data | None
 	# end: auto-generated types
 
@@ -88,6 +94,17 @@ class SocialLoginKey(Document):
 			frappe.throw(
 				_("Please enter Client Secret before social login is enabled"), exc=ClientSecretNotSetError
 			)
+		if self.auth_url_data:
+			try:
+				json.loads(self.auth_url_data)
+			except json.JSONDecodeError:
+				frappe.throw(_("Auth URL data should be valid JSON"))
+
+		if self.api_endpoint_args:
+			try:
+				json.loads(self.api_endpoint_args)
+			except json.JSONDecodeError:
+				frappe.throw(_("API Endpoint Args should be valid JSON"))
 
 	def set_icon(self):
 		icon_map = {
@@ -105,7 +122,7 @@ class SocialLoginKey(Document):
 			self.icon = f"/assets/frappe/icons/social/{icon_file}"
 
 	@frappe.whitelist()
-	def get_social_login_provider(self, provider, initialize=False):
+	def get_social_login_provider(self, provider: str, initialize: int | bool = False):
 		providers = {}
 
 		providers["Office 365"] = {
@@ -218,7 +235,7 @@ class SocialLoginKey(Document):
 			"provider_name": "Keycloak",
 			"enable_social_login": 1,
 			"custom_base_url": 1,
-			"redirect_url": "/api/method/frappe.integrations.oauth2_logins.login_via_keycloak/keycloak",
+			"redirect_url": "/api/method/frappe.integrations.oauth2_logins.login_via_keycloak",
 			"api_endpoint": "/protocol/openid-connect/userinfo",
 			"api_endpoint_args": None,
 			"authorize_url": "/protocol/openid-connect/auth",

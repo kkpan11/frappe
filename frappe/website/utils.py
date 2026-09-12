@@ -10,6 +10,7 @@ import yaml
 from werkzeug.wrappers import Response
 
 import frappe
+from frappe.app_state import get_disabled_doctypes
 from frappe.apps import get_apps, get_default_path, is_desk_apps
 from frappe.model.document import Document
 from frappe.utils import (
@@ -20,6 +21,8 @@ from frappe.utils import (
 	get_system_timezone,
 	md_to_html,
 )
+from frappe.utils.data import get_url_to_workspace
+from frappe.utils.user import is_portal_user
 
 FRONTMATTER_PATTERN = re.compile(r"^\s*(?:---|\+\+\+)(.*?)(?:---|\+\+\+)\s*(.+)$", re.S | re.M)
 H1_TAG_PATTERN = re.compile("<h1>([^<]*)")
@@ -94,19 +97,26 @@ def get_comment_list(doctype, name):
 
 
 def get_home_page():
-	if frappe.local.flags.home_page and not frappe.flags.in_test:
+	if frappe.local.flags.home_page and not frappe.in_test:
 		return frappe.local.flags.home_page
 
 	def _get_home_page():
 		home_page = None
-
 		# for user
 		if frappe.session.user != "Guest":
 			# by role
-			for role in frappe.get_roles():
-				home_page = frappe.db.get_value("Role", role, "home_page")
-				if home_page:
-					break
+			# For most of scenarios,Role table have `home_page` as NULL for all rows/roles, so we do a batch query to reduce DB calls.
+			# and later check if got the `home_page`for any of the roles.
+			all_roles = frappe.get_roles()
+			all_home_pages = frappe.db.get_values("Role", all_roles, "home_page", pluck=True)
+			assert isinstance(all_home_pages, list)
+			if all_home_pages.count(None) == len(all_home_pages):
+				pass
+			else:
+				for x in all_home_pages:
+					if x is not None:
+						home_page = x
+						break
 
 			# portal default
 			if not home_page:
@@ -124,10 +134,18 @@ def get_home_page():
 			home_page = "login" if frappe.session.user == "Guest" else "me"
 
 		home_page = home_page.strip("/")
+		if home_page == "me" and frappe.session.data.user_type == "System User":
+			home_page = "desk"
+		if home_page == "me" and is_portal_user():
+			home_page = "portal"
 
+		default_workspace = frappe.get_user().load_user_default_workspace()
+		if default_workspace:
+			home_page = get_url_to_workspace(default_workspace["name"], default_workspace["public"])
+			return home_page
 		return home_page
 
-	if frappe.local.dev_server:
+	if frappe._dev_server:
 		# dont return cached homepage in development
 		return _get_home_page()
 
@@ -177,10 +195,12 @@ def get_boot_data():
 		},
 		"sysdefaults": {
 			"float_precision": cint(frappe.get_system_settings("float_precision")) or 3,
+			"currency_precision": cint(frappe.get_system_settings("currency_precision")),
 			"date_format": get_date_format(),
 			"time_format": get_time_format(),
 			"first_day_of_the_week": get_first_day_of_the_week(),
 			"number_format": get_number_format().string,
+			"rounding_method": frappe.get_system_settings("rounding_method"),
 			"currency": frappe.get_system_settings("currency"),
 		},
 		"time_zone": {
@@ -457,8 +477,13 @@ def get_portal_sidebar_items():
 		roles = frappe.get_roles()
 		portal_settings = frappe.get_doc("Portal Settings", "Portal Settings")
 
+		disabled_doctypes = get_disabled_doctypes()
+
 		def add_items(sidebar_items, items):
 			for d in items:
+				if d.get("reference_doctype") in disabled_doctypes:
+					continue
+
 				if d.get("enabled") and ((not d.get("role")) or d.get("role") in roles):
 					sidebar_items.append(d.as_dict() if isinstance(d, Document) else d)
 
@@ -559,7 +584,7 @@ def build_response(path, data, http_status_code, headers: dict | None = None):
 
 	if headers:
 		for key, val in headers.items():
-			response.headers[key] = cstr(cstr(val).encode("ascii", errors="xmlcharrefreplace"))
+			response.headers[key] = cstr(cstr(val).encode("utf-8", errors="xmlcharrefreplace"))
 
 	return response
 
@@ -594,8 +619,27 @@ def add_preload_for_bundled_assets(response):
 		for svg in frappe.local.preload_assets["icons"]
 	)
 
+	MAX_LINK_HEADER_BYTES = 1000
 	if links:
-		response.headers["Link"] = ",".join(links)
+		trimmed = _fit_links_within_limit(links, MAX_LINK_HEADER_BYTES)
+		if trimmed:
+			response.headers["Link"] = ",".join(trimmed)
+
+
+def _fit_links_within_limit(links: list[str], byte_limit: int) -> list[str]:
+	result = []
+	total = 0
+
+	for link in links:
+		link_size = len(link.encode("utf-8"))
+		needed_size = link_size + (1 if result else 0)
+
+		if total + needed_size > byte_limit:
+			break
+
+		result.append(link)
+		total += needed_size
+	return result
 
 
 @lru_cache
@@ -605,3 +649,9 @@ def is_binary_file(path):
 	with open(path, "rb") as f:
 		content = f.read(1024)
 		return bool(content.translate(None, textchars))
+
+
+def check_if_webform_exists(route):
+	return frappe.db.exists("Web Form", {"name": route.strip("/")}) or frappe.db.exists(
+		"Web Form", {"route": route.strip("/")}
+	)

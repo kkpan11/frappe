@@ -3,8 +3,7 @@ frappe.ui.form.on("User", {
 		frm.set_query("default_workspace", () => {
 			return {
 				filters: {
-					for_user: ["in", [null, frappe.session.user]],
-					title: ["!=", "Welcome Workspace"],
+					for_user: ["in", ["", frappe.session.user]],
 				},
 			};
 		});
@@ -37,18 +36,6 @@ frappe.ui.form.on("User", {
 		}
 	},
 
-	role_profiles: function (frm) {
-		if (frm.doc.role_profiles && frm.doc.role_profiles.length) {
-			frm.roles_editor.disable = 1;
-			frm.call("populate_role_profile_roles").then(() => {
-				frm.roles_editor.show();
-			});
-		} else {
-			frm.roles_editor.disable = 0;
-			frm.roles_editor.show();
-		}
-	},
-
 	module_profile: function (frm) {
 		if (frm.doc.module_profile) {
 			frappe.call({
@@ -62,7 +49,13 @@ frappe.ui.form.on("User", {
 						let d = frm.add_child("block_modules");
 						d.module = v.module;
 					});
-					frm.module_editor && frm.module_editor.show();
+
+					// if I am able to edit module profile,
+					// module editor should always be available, but just in case
+					if (frm.module_editor) {
+						frm.module_editor.disable = 1;
+						frm.module_editor.show();
+					}
 				},
 			});
 		}
@@ -74,6 +67,8 @@ frappe.ui.form.on("User", {
 		if (frm.is_new() && frm.roles_editor) {
 			frm.roles_editor.reset();
 		}
+
+		frm.fields_dict.new_password?.$input?.attr("autocomplete", "new-password");
 
 		if (
 			frm.can_edit_roles &&
@@ -93,7 +88,11 @@ frappe.ui.form.on("User", {
 
 				if (frm.doc.user_type == "System User") {
 					var module_area = $("<div>").appendTo(frm.fields_dict.modules_html.wrapper);
-					frm.module_editor = new frappe.ModuleEditor(frm, module_area);
+					frm.module_editor = new frappe.ModuleEditor(
+						frm,
+						module_area,
+						frm.doc.module_profile ? 1 : 0
+					);
 				}
 			} else {
 				frm.roles_editor.show();
@@ -103,9 +102,14 @@ frappe.ui.form.on("User", {
 	refresh: function (frm) {
 		let doc = frm.doc;
 
+		frappe.scroll_to_user_roles_field = function () {
+			frappe.hide_msgprint(true);
+			frm.scroll_to_field("roles_html");
+		};
+
 		frappe.xcall("frappe.apps.get_apps").then((r) => {
 			let apps = r?.map((r) => r.name) || [];
-			frm.set_df_property("default_app", "options", [" ", ...apps]);
+			frm.set_df_property("default_app", "options", ["", ...apps]);
 		});
 
 		if (frm.is_new()) {
@@ -123,6 +127,9 @@ frappe.ui.form.on("User", {
 		}
 
 		frm.toggle_display(["sb1", "sb3", "modules_access"], false);
+		if (frm.is_new() && has_access_to_edit_user()) {
+			frm.toggle_display(["sb1", "sb3", "modules_access"], true);
+		}
 		frm.trigger("setup_impersonation");
 
 		if (!frm.is_new()) {
@@ -157,6 +164,17 @@ frappe.ui.form.on("User", {
 				);
 
 				frm.toggle_display(["sb1", "sb3", "modules_access"], true);
+			}
+
+			if (cint(frm.doc.enabled) && frm.has_perm("write")) {
+				frm.add_custom_button(
+					__("Change Password"),
+					() =>
+						frappe.ui.show_change_password_dialog(frm.doc.name, () =>
+							frm.reload_doc()
+						),
+					__("Password")
+				);
 			}
 
 			frm.add_custom_button(
@@ -200,18 +218,19 @@ frappe.ui.form.on("User", {
 										},
 									],
 									primary_action: (values) => {
-										d.hide();
 										if (values.new_password !== values.confirm_password) {
 											frappe.throw(__("Passwords do not match!"));
 										}
-										frappe.call(
-											"frappe.integrations.doctype.ldap_settings.ldap_settings.reset_password",
-											{
-												user: frm.doc.email,
-												password: values.new_password,
-												logout: values.logout_sessions,
-											}
-										);
+										return frappe
+											.call(
+												"frappe.integrations.doctype.ldap_settings.ldap_settings.reset_password",
+												{
+													user: frm.doc.email,
+													password: values.new_password,
+													logout: values.logout_sessions,
+												}
+											)
+											.then(() => d.hide());
 									},
 								});
 								d.show();
@@ -223,7 +242,7 @@ frappe.ui.form.on("User", {
 			}
 
 			if (
-				cint(frappe.boot.sysdefaults.enable_two_factor_auth) &&
+				frappe.defaults.is_enabled("enable_two_factor_auth") &&
 				(frappe.session.user == doc.name || frappe.user.has_role("System Manager"))
 			) {
 				frm.add_custom_button(
@@ -248,7 +267,10 @@ frappe.ui.form.on("User", {
 				frm.roles_editor.show();
 			}
 
-			frm.module_editor && frm.module_editor.show();
+			if (frm.module_editor) {
+				frm.module_editor.disable = frm.doc.module_profile ? 1 : 0;
+				frm.module_editor.show();
+			}
 
 			if (frappe.session.user == doc.name) {
 				// update display settings
@@ -336,7 +358,7 @@ frappe.ui.form.on("User", {
 			},
 			callback: function (r) {
 				if (r.message) {
-					frappe.msgprint(__("Save API Secret: {0}", [r.message.api_secret]));
+					show_api_key_dialog(r.message.api_key, r.message.api_secret);
 					frm.reload_doc();
 				}
 			},
@@ -371,8 +393,8 @@ frappe.ui.form.on("User", {
 	},
 	setup_impersonation: function (frm) {
 		if (
-			frappe.session.user === "Administrator" &&
-			frm.doc.name != "Administrator" &&
+			(frappe.session.user === "Administrator" || frm.has_perm("impersonate")) &&
+			frm.doc.name !== frappe.session.user &&
 			!frm.is_new()
 		) {
 			frm.add_custom_button(__("Impersonate"), () => {
@@ -425,6 +447,29 @@ frappe.ui.form.on("User Email", {
 	},
 });
 
+frappe.ui.form.on("User Role Profile", {
+	role_profiles_add: function (frm) {
+		if (frm.doc.role_profiles.length > 0) {
+			if (frm.roles_editor) {
+				frm.roles_editor.disable = 1;
+			}
+			frm.call("populate_role_profile_roles").then(() => {
+				if (frm.roles_editor) {
+					frm.roles_editor.show();
+				}
+			});
+		}
+	},
+	role_profiles_remove: function (frm) {
+		if (frm.doc.role_profiles.length == 0) {
+			if (frm.roles_editor) {
+				frm.roles_editor.disable = 0;
+				frm.roles_editor.show();
+			}
+		}
+	},
+});
+
 function has_access_to_edit_user() {
 	return has_common(frappe.user_roles, get_roles_for_editing_user());
 }
@@ -437,3 +482,60 @@ function get_roles_for_editing_user() {
 			.map((perm) => perm.role) || ["System Manager"]
 	);
 }
+
+function show_api_key_dialog(api_key, api_secret) {
+	const dialog = new frappe.ui.Dialog({
+		title: __("API Keys"),
+		fields: [
+			{
+				label: __("API Key"),
+				fieldname: "api_key",
+				fieldtype: "Code",
+				read_only: 1,
+				default: api_key,
+			},
+			{
+				label: __("API Secret"),
+				fieldname: "api_secret",
+				fieldtype: "Code",
+				read_only: 1,
+				default: api_secret,
+			},
+		],
+		size: "small",
+		primary_action_label: __("Download"),
+		primary_action: () => {
+			frappe.tools.downloadify(
+				[
+					["api_key", "api_secret"],
+					[api_key, api_secret],
+				],
+				"System Manager",
+				"frappe_api_keys"
+			);
+
+			dialog.hide();
+		},
+		secondary_action_label: __("Copy token to clipboard"),
+		secondary_action: () => {
+			const token = `${api_key}:${api_secret}`;
+			frappe.utils.copy_to_clipboard(token);
+			dialog.hide();
+		},
+	});
+
+	dialog.show();
+	dialog.show_message(
+		__("Store the API secret securely. It won't be displayed again."),
+		"yellow",
+		1
+	);
+}
+
+frappe.ui.form.on("User Session Display", {
+	sign_out(frm, doctype, name) {
+		frappe
+			.xcall("frappe.core.doctype.user.user.clear_session", { sid_hash: name })
+			.then(() => frm.reload_doc());
+	},
+});

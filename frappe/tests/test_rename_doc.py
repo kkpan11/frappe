@@ -37,6 +37,21 @@ def patch_db(endpoints: list[str] | None = None):
 		frappe.db.rollback(save_point=savepoint)
 
 
+class TestRenameSingleDocType(IntegrationTestCase):
+	def test_rename_single_doctype(self):
+		old_name = "Test Single Rename Old"
+		new_name = "Test Single Rename New"
+		new_doctype(old_name, issingle=1).insert()
+		single = frappe.get_single(old_name)
+		single.some_fieldname = "some value"
+		single.save()
+
+		self.assertEqual(new_name, frappe.rename_doc("DocType", old_name, new_name, force=True))
+		self.assertEqual(frappe.db.get_single_value(new_name, "some_fieldname"), "some value")
+		self.assertEqual(frappe.db.get_single_value(new_name, "name"), new_name)
+		self.assertEqual(frappe.db.count("Singles", {"doctype": old_name}), 0)
+
+
 class TestRenameDoc(IntegrationTestCase):
 	@classmethod
 	def setUpClass(self):
@@ -245,11 +260,19 @@ class TestRenameDoc(IntegrationTestCase):
 				doctype=self.test_doctype,
 			)
 
+	def test_bulk_rename_accepts_native_merge_flag(self):
+		# 3rd column as a native bool exercises sbool(row[2]); False keeps it a simple rename
+		input_data = [[x, f"{x}-native", False] for x in self.available_documents]
+
+		with patch_db(["commit", "rollback"]), patch("frappe.enqueue"):
+			message_log = bulk_rename(self.test_doctype, input_data, via_console=False)
+			self.assertEqual(len(message_log), len(self.available_documents))
+
 	def test_doc_rename_method(self):
 		name = choice(self.available_documents)
 		new_name = f"{name}-{frappe.generate_hash(length=4)}"
 		doc = frappe.get_doc(self.test_doctype, name)
-		doc.rename(new_name, merge=frappe.db.exists(self.test_doctype, new_name))
+		doc.rename(new_name, merge=bool(frappe.db.exists(self.test_doctype, new_name)))
 		self.assertEqual(doc.name, new_name)
 		self.available_documents.append(new_name)
 		self.available_documents.remove(name)

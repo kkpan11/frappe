@@ -1,20 +1,56 @@
 from typing import Any
 
 from pypika.functions import DistinctOptionFunction
-from pypika.terms import Term
+from pypika.terms import Function, Term
 from pypika.utils import builder, format_alias_sql, format_quotes
 
 import frappe
 
 
 class GROUP_CONCAT(DistinctOptionFunction):
-	def __init__(self, column: str, alias: str | None = None):
+	def __init__(self, column: str, separator: str = ",", alias: str | None = None):
 		"""[ Implements the group concat function read more about it at https://www.geeksforgeeks.org/mysql-group_concat-function ]
 		Args:
 		        column (str): [ name of the column you want to concat]
+		        separator (str, optional): [ separator to be used ]. Defaults to ",". The argument
+		            order mirrors STRING_AGG so the db-aware ``GroupConcat`` mapper can pass a custom
+		            separator portably; ``.separator()`` chaining still works for back-compat.
 		        alias (Optional[str], optional): [ is this an alias? ]. Defaults to None.
 		"""
 		super().__init__("GROUP_CONCAT", column, alias=alias)
+		self._separator = separator
+
+	@builder
+	def separator(self, separator: str = ","):
+		"""Adds a separator to the GROUP_CONCAT function.
+		Args:
+				separator (str, optional): [separator to be used]. Defaults to ",".
+		"""
+		self._separator = separator
+
+	def get_sql(self, **kwargs):
+		# SEPARATOR goes inside the closing paren, so render without the alias and re-attach it
+		# below rather than let Function.get_sql place it before the clause exists.
+		query_alias = self.alias
+		self.alias = None
+		try:
+			sql = super().get_sql(**kwargs)
+		finally:
+			self.alias = query_alias
+		# an explicit "" is a real request for no delimiter, not "use the default": dropping the
+		# clause would silently fall back to MariaDB's comma while STRING_AGG concatenates bare.
+		if self._separator is not None:
+			assert sql.endswith(")"), "GROUP_CONCAT SQL must end with ')' before injecting SEPARATOR"
+			sql = f"{sql[:-1]} SEPARATOR {frappe.db.escape(self._separator)})"
+
+		# Re-attach through format_alias_sql, the same path every other term uses: it escapes the
+		# quote char in the alias, and honours `with_alias` so the alias is emitted in the SELECT
+		# clause only. Hand-rolling it quoted the alias raw -- disagreeing with the escaped alias
+		# pypika renders for the same term in GROUP BY / ORDER BY -- and appended it in operand
+		# position too, where `GROUP_CONCAT(...) `a` LIKE ...` is a syntax error.
+		if kwargs.get("with_alias"):
+			return format_alias_sql(sql, query_alias, **kwargs)
+		return sql
 
 
 class STRING_AGG(DistinctOptionFunction):
@@ -27,6 +63,12 @@ class STRING_AGG(DistinctOptionFunction):
 		        alias (Optional[str], optional): [description]. Defaults to None.
 		"""
 		super().__init__("STRING_AGG", column, separator, alias=alias)
+
+	@builder
+	def separator(self, separator: str = ","):
+		"""Mirror GROUP_CONCAT.separator() so GroupConcat(...).separator(...) chaining works on
+		postgres too. STRING_AGG takes the separator as its second argument."""
+		self.args[1] = self.wrap_constant(separator)
 
 
 class MATCH(DistinctOptionFunction):
@@ -65,13 +107,16 @@ class TO_TSVECTOR(DistinctOptionFunction):
 		        column (str): [ column to search in ]
 		"""
 		alias = kwargs.get("alias")
-		super().__init__("TO_TSVECTOR", column, *args, alias=alias)
+		# Pin the 'english' regconfig: it makes to_tsvector immutable so a GIN index can back it
+		# (the 1-arg form depends on a session GUC and can't be indexed); plainto_tsquery uses the
+		# same config so the index over to_tsvector('english', content) is actually used.
+		super().__init__("TO_TSVECTOR", "english", column, *args, alias=alias)
 		self._PLAINTO_TSQUERY = False
 
 	def get_function_sql(self, **kwargs):
 		s = super(DistinctOptionFunction, self).get_function_sql(**kwargs)
 		if self._PLAINTO_TSQUERY:
-			return f"{s} @@ PLAINTO_TSQUERY({frappe.db.escape(self._PLAINTO_TSQUERY)})"
+			return f"{s} @@ PLAINTO_TSQUERY('english', {frappe.db.escape(self._PLAINTO_TSQUERY)})"
 		return s
 
 	@builder
@@ -98,3 +143,61 @@ class ConstantColumn(Term):
 			quote_char=quote_char,
 			**kwargs,
 		)
+
+
+# MONTHNAME/MONTH/QUARTER are MySQL-only. On postgres use to_char / date_part: to_char(.., 'FMMonth')
+# gives the full month name, and date_part gives the numeric month/quarter. date_part returns double
+# precision, so MONTH/QUARTER cast it back to INTEGER to match MySQL's integer result exactly (see
+# _PostgresIntDatePart) -- otherwise a `2.0` leaks into report JSON/UI where MariaDB shows `2`.
+def _is_postgres() -> bool:
+	return bool(frappe.db) and frappe.db.db_type == "postgres"
+
+
+class _PostgresIntDatePart:
+	"""Mixin for the postgres date_part(...) functions below: wrap the result in
+	CAST(... AS INTEGER) so it matches MySQL's integer MONTH()/QUARTER(). Mirrors the
+	UnixTimestamp BIGINT cast. No-op on MariaDB (those branches use the native int function)."""
+
+	def get_sql(self, **kwargs):
+		if not self._postgres:
+			return super().get_sql(**kwargs)
+		with_alias = kwargs.pop("with_alias", False)
+		sql = f"CAST({super().get_sql(**kwargs)} AS INTEGER)"
+		if with_alias:
+			return format_alias_sql(sql, self.alias, **kwargs)
+		return sql
+
+
+class MonthName(Function):
+	def __init__(self, field, alias=None):
+		if _is_postgres():
+			super().__init__("to_char", field, "FMMonth", alias=alias)
+		else:
+			super().__init__("MONTHNAME", field, alias=alias)
+
+
+class Quarter(_PostgresIntDatePart, Function):
+	def __init__(self, field, alias=None):
+		self._postgres = _is_postgres()
+		if self._postgres:
+			super().__init__("date_part", "quarter", field, alias=alias)
+		else:
+			super().__init__("QUARTER", field, alias=alias)
+
+
+class Month(_PostgresIntDatePart, Function):
+	def __init__(self, field, alias=None):
+		self._postgres = _is_postgres()
+		if self._postgres:
+			super().__init__("date_part", "month", field, alias=alias)
+		else:
+			super().__init__("MONTH", field, alias=alias)
+
+
+class Year(_PostgresIntDatePart, Function):
+	def __init__(self, field, alias=None):
+		self._postgres = _is_postgres()
+		if self._postgres:
+			super().__init__("date_part", "year", field, alias=alias)
+		else:
+			super().__init__("YEAR", field, alias=alias)

@@ -4,18 +4,9 @@ import frappe
 from frappe.core.doctype.doctype.doctype import clear_permissions_cache
 from frappe.model.db_query import DatabaseQuery
 from frappe.permissions import add_permission, reset_perms
-from frappe.tests import IntegrationTestCase, UnitTestCase
+from frappe.tests import IntegrationTestCase
 
-EXTRA_TEST_RECORD_DEPENDENCIES = ["User"]
-
-
-class UnitTestTodo(UnitTestCase):
-	"""
-	Unit tests for Todo.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
+EXTRA_TEST_RECORD_DEPENDENCIES = ["User", "Web Page"]
 
 
 class TestToDo(IntegrationTestCase):
@@ -102,8 +93,8 @@ class TestToDo(IntegrationTestCase):
 
 		frappe.set_user("Administrator")
 
-		test_user.add_roles("Blogger")
-		add_permission("ToDo", "Blogger")
+		test_user.add_roles("Website Manager")
+		add_permission("ToDo", "Website Manager")
 
 		frappe.set_user("test4@example.com")
 
@@ -112,9 +103,31 @@ class TestToDo(IntegrationTestCase):
 		self.assertFalse(todo1.has_permission("write"))
 
 		frappe.set_user("Administrator")
-		test_user.remove_roles("Blogger")
+		test_user.remove_roles("Website Manager")
 		reset_perms("ToDo")
 		clear_permissions_cache("ToDo")
+		frappe.db.rollback()
+
+	def test_owner_only_access(self):
+		# owner is test4, but assigned_by and allocated_to belong to someone else
+		frappe.set_user("test4@example.com")
+		todo = frappe.get_doc(
+			doctype="ToDo", description="Owner only todo", assigned_by="testperm@example.com"
+		).insert()
+
+		self.assertEqual(todo.owner, "test4@example.com")
+		self.assertNotEqual(todo.assigned_by, "test4@example.com")
+		self.assertFalse(todo.allocated_to)
+
+		# direct document access should be granted on ownership alone
+		self.assertTrue(todo.has_permission("read"))
+		self.assertTrue(todo.has_permission("write"))
+
+		# list view / report filtering should also surface owned todos
+		todo_names = DatabaseQuery("ToDo").execute(filters={"name": todo.name}, pluck="name")
+		self.assertIn(todo.name, todo_names)
+
+		frappe.set_user("Administrator")
 		frappe.db.rollback()
 
 	def test_fetch_if_empty(self):

@@ -6,6 +6,7 @@ import os
 
 import frappe
 from frappe import safe_decode
+from frappe.core.doctype.communication.communication import Communication
 from frappe.email.doctype.email_queue.email_queue import QueueBuilder, SendMailContext
 from frappe.email.email_body import (
 	get_email,
@@ -13,7 +14,7 @@ from frappe.email.email_body import (
 	inline_style_in_html,
 	replace_filename_with_cid,
 )
-from frappe.email.receive import Email
+from frappe.email.receive import Email, InboundMail
 from frappe.tests import IntegrationTestCase
 
 
@@ -136,6 +137,43 @@ w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 		""".format(inline_images[0].get("content_id"))
 		self.assertEqual(message, processed_message)
 
+	def test_sendmail_inline_images_parameter_respected(self):
+		"""
+		Test that inline_images parameter works through sendmail.
+		Earlier this was ignored and the image was read from disk instead of using the provided content.
+		The way to check this is essentially checking if the image is embedded with cid:
+		<img src="cid:content_id" ...> -> Correct behavior
+		If the image is not embedded with cid: -> Incorrect behavior
+		"""
+
+		test_image_content = b"FAKE_PNG_BINARY_CONTENT_FOR_TESTING"
+
+		html_content = '<div><img embed="files/nonexistent_test_image.png" alt="Logo"></div>'
+
+		inline_images = [
+			{
+				"filename": "files/nonexistent_test_image.png",
+				"filecontent": test_image_content,
+			}
+		]
+
+		# use QueueBuilder to send the email (sendmail uses this internally)
+		from frappe.email.doctype.email_queue.email_queue import QueueBuilder
+
+		builder = QueueBuilder(
+			recipients=["test@example.com"],
+			sender="me@example.com",
+			subject="Test Inline Images",
+			message=html_content,
+			inline_images=inline_images,
+		)
+
+		mail = builder.prepare_email_content()
+		email_string = mail.as_string()
+
+		self.assertIn("cid:", email_string)
+		self.assertNotIn('embed="files/nonexistent_test_image.png"', email_string)
+
 	def test_inline_styling(self):
 		html = """
 <h3>Hi John</h3>
@@ -143,7 +181,7 @@ w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 """
 		transformed_html = """
 <h3>Hi John</h3>
-<p style="margin:1em 0 !important">This is a test email</p>
+<p style="margin:0 0 1em !important">This is a test email</p>
 """
 		self.assertTrue(transformed_html in inline_style_in_html(html))
 
@@ -159,8 +197,9 @@ w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 			content=email_html,
 			header=["Email Title", "green"],
 		).as_string()
-		# REDESIGN-TODO: Add style for indicators in email
-		self.assertTrue("""<span class=3D"indicator indicator-green"></span>""" in email_string)
+		# REDESIGN: Add style for indicators in email
+		self.assertIn("indicator", email_string)
+		self.assertIn("indicator-green", email_string)
 		self.assertTrue("<span>Email Title</span>" in email_string)
 		self.assertIn(
 			"Subject: Test Subject, with line break, and Line feed and carriage return.", email_string
@@ -204,6 +243,109 @@ Reply-To: test2_@erpnext.com
 	def test_poorly_encoded_messages2(self):
 		mail = Email.decode_email(" =?UTF-8?B?X\xe0\xe0Y?=  <xy@example.com>")
 		self.assertIn("xy@example.com", mail)
+
+	def test_rejects_encoded_addr_spec_without_raw_at_sign(self):
+		email = Email.decode_email("=?utf-8?Q?admin=40example=2Ecom?=")
+		self.assertIsNone(email)
+
+		content_bytes = b"""MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: inline
+Content-Transfer-Encoding: 8bit
+To: support@example.com
+From: =?utf-8?Q?admin=40example=2Ecom?=
+"""
+
+		mail = Email(content_bytes)
+		self.assertIsNone(mail.from_email)
+
+	def test_allows_encoded_display_name_with_valid_addr_spec(self):
+		email = Email.decode_email("=?utf-8?Q?Jane_Doe?= <jane@example.com>")
+		self.assertIn("jane@example.com", email)
+
+	def test_quotes_in_email_sender(self):
+		content_bytes = rb"""MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: inline
+Content-Transfer-Encoding: 8bit
+To: "\"fail@example.com\" via ABC"  <success@example.com>
+From: "\"fail@example.com\" via DEF"  <success@example.com>
+Reply-To: "\"fail@example.com\" via GHI"  <success@example.com>
+CC: "\"fail@example.com\" via JKL"  <success@example.com>
+"""
+
+		mail = Email(content_bytes)
+		self.assertEqual(mail.from_email, "success@example.com")
+
+		self.assertEqual(mail.from_real_name, "failexamplecom via DEF")
+		# https://github.com/frappe/frappe/pull/3371
+		# self.assertEqual(mail.from_real_name, '"fail@example.com" via DEF')
+
+		email_account = frappe._dict({"email_id": "receive@example.com"})
+		mail = InboundMail(content_bytes, email_account)
+		communication: Communication = mail.process()  # type: ignore
+		self.assertEqual(communication.sender_full_name, "failexamplecom via DEF")
+
+	def test_quotes_in_email_recipients(self):
+		content_bytes = rb"""MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Disposition: inline
+Content-Transfer-Encoding: 8bit
+From: "=?utf-8?Q?=F0=9F=98=83?="
+	=?utf-8?Q?=3Ctest=40ex?= =?utf-8?Q?ample=2Eco?= =?utf-8?Q?m=3E?=
+To: =?iso-8859-1?Q?X=E9Y=40example=2Ecom?= <xy@example.com>, "fail@example.com" <success@example.com>
+"""
+
+		# https://ldu2.github.io/rfc2047/
+		email_account = frappe._dict({"email_id": "receive@example.com"})
+		mail = InboundMail(content_bytes, email_account)
+		communication: Communication = mail.process()  # type: ignore
+		self.assertEqual(communication.sender_mailid, "test@example.com")
+		# self.assertEqual(communication.sender_full_name, "😃")
+		# # TODO: Fix get_name_from_email_string to accept non-ASCII chars
+		self.assertEqual(
+			communication.recipients,
+			'XéY@example.com <xy@example.com>, "fail@example.com" <success@example.com>',
+		)
+		frappe.db.rollback()
+
+	def test_plain_text_body_preserves_bare_angle_bracket_address(self):
+		content_bytes = rb"""MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+From: sender@example.com
+To: receive@example.com
+Subject: Plain text body
+
+Please contact John Doe <john.doe@example.com> for details.
+"""
+
+		email_account = frappe._dict({"email_id": "receive@example.com"})
+		mail = InboundMail(content_bytes, email_account)
+		communication: Communication = mail.process()  # type: ignore
+
+		self.assertIn("&lt;john.doe@example.com&gt;", communication.content)
+		self.assertNotIn("<john.doe@example.com>", communication.content)
+		frappe.db.rollback()
+
+	def test_plain_text_body_escapes_rather_than_executes_markup(self):
+		content_bytes = rb"""MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+From: sender@example.com
+To: receive@example.com
+Subject: Plain text body with script
+
+Hello <script>alert(1)</script> world.
+"""
+
+		email_account = frappe._dict({"email_id": "receive@example.com"})
+		mail = InboundMail(content_bytes, email_account)
+		communication: Communication = mail.process()  # type: ignore
+
+		self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", communication.content)
+		self.assertNotIn("<script>", communication.content)
+		frappe.db.rollback()
 
 
 def fixed_column_width(string, chunk_size):

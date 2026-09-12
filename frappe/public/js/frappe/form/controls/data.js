@@ -70,9 +70,11 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		if (this.df.options == "URL") {
 			this.setup_url_field();
 		}
-
 		if (this.df.options == "Barcode") {
 			this.setup_barcode_field();
+		}
+		if (this.df.options == "IBAN") {
+			this.setup_iban_field();
 		}
 	}
 
@@ -80,7 +82,7 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		this.$wrapper.find(".control-input").append(
 			`<span class="link-btn">
 				<a class="btn-open no-decoration" title="${__("Open Link")}" target="_blank">
-					${frappe.utils.icon("link-url", "sm")}
+					${frappe.utils.icon("link", "sm")}
 				</a>
 			</span>`
 		);
@@ -119,6 +121,12 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		});
 	}
 
+	setup_iban_field() {
+		this.$input.on("blur", () => {
+			this.set_formatted_input(this.get_input_value());
+		});
+	}
+
 	setup_copy_button() {
 		if (this.df.with_copy_button) {
 			this.$wrapper
@@ -139,7 +147,7 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		this.$wrapper.find(".control-input").append(
 			`<span class="link-btn">
 				<a class="btn-open no-decoration" title="${__("Scan")}">
-					${frappe.utils.icon("scan", "sm")}
+					${frappe.utils.icon("scan-barcode", "sm")}
 				</a>
 			</span>`
 		);
@@ -148,6 +156,9 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		this.$scan_btn.toggle(true);
 
 		const me = this;
+		$(document).on("frappe.ui.Dialog:shown", function () {
+			me.$scan_btn.toggle(true);
+		});
 		this.$scan_btn.on("click", "a", () => {
 			new frappe.ui.Scanner({
 				dialog: true,
@@ -173,6 +184,12 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		if (this.constructor.trigger_change_on_input_event && !this.in_grid()) {
 			// debounce to avoid repeated validations on value change
 			this.$input.on("input", frappe.utils.debounce(change_handler, 500));
+		}
+
+		if (this.constructor?.trigger_dirty_on_input_event) {
+			this.$input.on("input", () => {
+				this.frm?.dirty();
+			});
 		}
 	}
 	setup_autoname_check() {
@@ -230,7 +247,7 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		this.$input
 			.attr("data-fieldtype", this.df.fieldtype)
 			.attr("data-fieldname", this.df.fieldname)
-			.attr("placeholder", this.df.placeholder || "");
+			.attr("placeholder", __(this.df.placeholder || ""));
 		if (this.doctype) {
 			this.$input.attr("data-doctype", this.doctype);
 		}
@@ -239,6 +256,13 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		}
 		if (this.df.input_class) {
 			this.$input.addClass(this.df.input_class);
+		}
+		// Apply alignment for supported field types
+		if (
+			this.df.alignment &&
+			["Data", "Int", "Float", "Currency", "Percent"].includes(this.df.fieldtype)
+		) {
+			this.$input.css("text-align", this.df.alignment.toLowerCase());
 		}
 	}
 	set_input(value) {
@@ -255,7 +279,16 @@ frappe.ui.form.ControlData = class ControlData extends frappe.ui.form.ControlInp
 		return this.$input ? this.$input.val() : undefined;
 	}
 	format_for_input(val) {
+		if (this.df.options == "IBAN" && val) {
+			return frappe.utils.get_formatted_iban(val);
+		}
 		return val == null ? "" : val;
+	}
+	parse(value) {
+		if (this.df.options == "IBAN" && value) {
+			return value.replaceAll(" ", "");
+		}
+		return value;
 	}
 	validate(v) {
 		if (!v) {

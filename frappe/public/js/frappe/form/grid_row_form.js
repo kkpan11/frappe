@@ -17,6 +17,8 @@ export default class GridRowForm {
 			grid: this.row.grid,
 			grid_row: this.row,
 			grid_row_form: this,
+			is_child_table: true,
+			doctype: this.row.grid.doctype,
 		});
 		this.layout.make();
 
@@ -44,22 +46,33 @@ export default class GridRowForm {
 					<span class="panel-title">
 						${__("Editing Row")} #<span class="grid-form-row-index"></span></span>
 					<span class="row-actions">
-						<button class="btn btn-secondary btn-sm pull-right grid-collapse-row">
-							${frappe.utils.icon("down")}
-						</button>
-						<button class="btn btn-secondary btn-sm pull-right grid-move-row hidden-xs">
-							${__("Move")}</button>
-						<button class="btn btn-secondary btn-sm pull-right grid-duplicate-row hidden-xs">
-							${frappe.utils.icon("duplicate")}
-							${__("Duplicate")}
-						</button>
-						<button class="btn btn-secondary btn-sm pull-right grid-insert-row hidden-xs">
-							${__("Insert Above")}</button>
-						<button class="btn btn-secondary btn-sm pull-right grid-insert-row-below hidden-xs">
-							${__("Insert Below")}</button>
-						<button class="btn btn-danger btn-sm pull-right grid-delete-row">
-							${frappe.utils.icon("delete")}
-						</button>
+						${frappe.ui.button.html({
+							icon: "chevron-down",
+							title: __("Collapse"),
+							css_class: "pull-right grid-collapse-row",
+						})}
+						${frappe.ui.button.html({
+							label: __("Move"),
+							css_class: "pull-right grid-move-row hidden-xs",
+						})}
+						${frappe.ui.button.html({
+							icon: "copy",
+							label: __("Duplicate"),
+							css_class: "pull-right grid-duplicate-row hidden-xs",
+						})}
+						${frappe.ui.button.html({
+							label: __("Insert Above"),
+							css_class: "pull-right grid-insert-row hidden-xs",
+						})}
+						${frappe.ui.button.html({
+							label: __("Insert Below"),
+							css_class: "pull-right grid-insert-row-below hidden-xs",
+						})}
+						${frappe.ui.button.html({
+							label: __("Delete"),
+							theme: "red",
+							css_class: "pull-right grid-delete-row",
+						})}
 					</span>
 				</div>
 			</div>
@@ -71,11 +84,6 @@ export default class GridRowForm {
 						<span class="text-medium"> ${__("Shortcuts")}: </span>
 						<kbd>${__("Ctrl + Up")}</kbd> . <kbd>${__("Ctrl + Down")}</kbd> . <kbd>${__("ESC")}</kbd>
 					</div>
-					<span class="row-actions">
-						<button class="btn btn-secondary btn-sm pull-right grid-append-row">
-							${__("Insert Below")}
-						</button>
-					</span>
 				</div>
 			</div>`;
 
@@ -107,18 +115,13 @@ export default class GridRowForm {
 			me.row.move();
 			return false;
 		});
-		this.wrapper.find(".grid-append-row").on("click", function () {
-			me.row.toggle_view(false);
-			me.row.grid.add_new_row(me.row.doc.idx + 1, null, true);
-			return false;
-		});
 		this.wrapper.find(".grid-form-heading, .grid-footer-toolbar").on("click", function () {
 			me.row.toggle_view();
 			return false;
 		});
 	}
 	toggle_add_delete_button_display($parent) {
-		$parent.find(".row-actions, .grid-append-row").toggle(this.row.grid.is_editable());
+		$parent.find(".row-actions").toggle(this.row.grid.is_editable());
 	}
 	refresh_field(fieldname) {
 		const field = this.fields_dict[fieldname];
@@ -127,6 +130,22 @@ export default class GridRowForm {
 		field.docname = this.row.doc.name;
 		field.refresh();
 		this.layout && this.layout.refresh_dependency();
+	}
+	set_active_tab(tab) {
+		// Store the active tab for this grid row form
+		this.active_tab = tab;
+
+		// When switching tabs in grid row forms, update field display for Geolocation/Signature fields
+		// This is similar to the fix in frappe/frappe#27441 for regular forms
+		let in_tab = false;
+		for (const df of this.layout.fields) {
+			const field = this.fields_dict[df.fieldname];
+			if (df?.fieldtype === "Tab Break") {
+				in_tab = df === tab?.df;
+			} else if (typeof field?.on_section_collapse === "function") {
+				field.on_section_collapse(!in_tab);
+			}
+		}
 	}
 	set_focus() {
 		// wait for animation and then focus on the first row

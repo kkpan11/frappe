@@ -1,8 +1,8 @@
 context("Control Autocomplete", () => {
 	before(() => {
 		cy.login();
-		cy.visit("/app");
-		cy.wait(4000);
+		cy.visit("/desk");
+		cy.desk_ready();
 	});
 
 	const get_dialog_with_autocomplete = (fieldname, options) => {

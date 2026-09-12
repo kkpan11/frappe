@@ -40,8 +40,19 @@ def update_user_settings(doctype, user_settings, for_update=False):
 			current = {}
 
 		current.update(user_settings)
-
 	frappe.cache.hset("_user_settings", f"{doctype}::{frappe.session.user}", json.dumps(current))
+
+
+def clear_user_settings_cache(doctype: str):
+	"""Clear cached user settings for a doctype across all users."""
+	prefix = f"{doctype}::"
+	keys = [
+		decoded
+		for key in frappe.cache.hkeys("_user_settings")
+		if (decoded := safe_decode(key)).startswith(prefix)
+	]
+	if keys:
+		frappe.cache.hdel("_user_settings", keys)
 
 
 def sync_user_settings():
@@ -54,11 +65,9 @@ def sync_user_settings():
 				"mariadb": """INSERT INTO `__UserSettings`(`user`, `doctype`, `data`)
 				VALUES (%s, %s, %s)
 				ON DUPLICATE key UPDATE `data`=%s""",
-				"postgres": """INSERT INTO `__UserSettings` (`user`, `doctype`, `data`)
+				"*": """INSERT INTO `__UserSettings` (`user`, `doctype`, `data`)
 				VALUES (%s, %s, %s)
-				ON CONFLICT ("user", "doctype") DO UPDATE SET `data`=%s""",
-				"sqlite": """INSERT OR REPLACE INTO `__UserSettings` (`user`, `doctype`, `data`)
-				VALUES (%s, %s, %s)""",
+				ON CONFLICT (`user`, `doctype`) DO UPDATE SET `data`=%s""",
 			},
 			(user, doctype, data, data),
 			as_dict=1,
@@ -66,14 +75,14 @@ def sync_user_settings():
 
 
 @frappe.whitelist()
-def save(doctype, user_settings):
-	user_settings = json.loads(user_settings or "{}")
+def save(doctype: str, user_settings: str | dict):
+	user_settings = frappe.parse_json(user_settings) or {}
 	update_user_settings(doctype, user_settings)
 	return user_settings
 
 
 @frappe.whitelist()
-def get(doctype):
+def get(doctype: str):
 	return get_user_settings(doctype)
 
 

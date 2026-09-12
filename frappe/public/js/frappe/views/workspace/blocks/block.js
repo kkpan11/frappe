@@ -140,7 +140,7 @@ export default class Block {
 
 	add_new_block_button() {
 		let $new_button = $(`
-			<div class="new-block-button">${frappe.utils.icon("add-round", "lg")}</div>
+			<div class="new-block-button">${frappe.utils.icon("circle-plus", "lg")}</div>
 		`);
 
 		$new_button.appendTo(this.wrapper);
@@ -159,13 +159,13 @@ export default class Block {
 			{
 				label: "Delete",
 				title: "Delete Block",
-				icon: frappe.utils.icon("delete-active", "sm"),
+				icon: frappe.utils.icon("trash-2", "sm"),
 				action: () => this.api.blocks.delete(),
 			},
 			{
 				label: "Expand",
 				title: "Expand Block",
-				icon: frappe.utils.icon("expand-alt", "sm"),
+				icon: frappe.utils.icon("expand", "sm"),
 				action: () => this.increase_width(),
 			},
 			{
@@ -177,14 +177,20 @@ export default class Block {
 			{
 				label: "Move Up",
 				title: "Move Up",
-				icon: frappe.utils.icon("up-arrow", "sm"),
+				icon: frappe.utils.icon("arrow-up", "sm"),
 				action: () => this.move_block("up"),
 			},
 			{
 				label: "Move Down",
 				title: "Move Down",
-				icon: frappe.utils.icon("down-arrow", "sm"),
+				icon: frappe.utils.icon("arrow-down", "sm"),
 				action: () => this.move_block("down"),
+			},
+			{
+				label: "Duplicate",
+				title: "Duplicate",
+				icon: frappe.utils.icon("copy", "sm"),
+				action: () => this.duplicate_block(),
 			},
 		];
 
@@ -193,7 +199,7 @@ export default class Block {
 		let $button = $(`
 			<div class="dropdown-btn">
 				<button class="btn btn-secondary btn-xs setting-btn" title="${__("Setting")}">
-					${frappe.utils.icon("dot-horizontal", "xs")}
+					${frappe.utils.icon("ellipsis", "xs")}
 				</button>
 				<div class="dropdown-list hidden"></div>
 			</div>
@@ -336,5 +342,18 @@ export default class Block {
 		let current_index = this.api.blocks.getCurrentBlockIndex();
 		let new_index = current_index + (direction == "down" ? 1 : -1);
 		this.api.blocks.move(new_index, current_index);
+	}
+
+	duplicate_block() {
+		const current_block_index = this.api.blocks.getCurrentBlockIndex();
+		const current_block = this.api.blocks.getBlockByIndex(current_block_index);
+
+		if (!current_block) return;
+
+		const type = current_block.name;
+		const data = this.data;
+
+		this.api.blocks.insert(type, data, null, current_block_index + 1, true);
+		this.api.caret.setToBlock(current_block_index + 1, "end");
 	}
 }

@@ -14,9 +14,12 @@ frappe.ui.form.ControlMultiSelectList = class ControlMultiSelectList extends (
 					</li>
 					<div class="selectable-items">
 					</div>
-					<li class="text-right">
+					<li class="d-flex justify-content-end">
+						<button class="btn btn-secondary btn-xs select-all-options text-nowrap mr-2">
+							${__("Select All")}
+						</button>
 						<button class="btn btn-primary btn-xs clear-selections text-nowrap">
-							Clear All
+							${__("Clear All")}
     					</button>
 					</li>
 				</ul>
@@ -39,10 +42,37 @@ frappe.ui.form.ControlMultiSelectList = class ControlMultiSelectList extends (
 		this.$list_wrapper.on("click", ".clear-selections", (e) => {
 			this.clear_all_selections();
 		});
+		this.$list_wrapper.on("click", ".select-all-options", (e) => {
+			this.select_all_options();
+		});
 		this.$list_wrapper.on("click", ".selectable-item", (e) => {
 			let $target = $(e.currentTarget);
 			this.toggle_select_item($target);
 		});
+
+		// open dropdown on tab focus
+		const $toggle = this.$list_wrapper.find('[data-toggle="dropdown"]');
+		let focus_triggered_by_mouse = false;
+		$toggle.on("mousedown", () => {
+			focus_triggered_by_mouse = true;
+		});
+		$toggle.on("focus", () => {
+			if (focus_triggered_by_mouse) {
+				focus_triggered_by_mouse = false;
+				return;
+			}
+			$toggle.dropdown("show");
+		});
+
+		// prevent input text focus loss when clicking items or buttons
+		this.$list_wrapper.on(
+			"mousedown",
+			".selectable-item, .select-all-options, .clear-selections",
+			(e) => {
+				e.preventDefault();
+			}
+		);
+
 		this.$list_wrapper.on(
 			"input",
 			"input",
@@ -99,6 +129,7 @@ frappe.ui.form.ControlMultiSelectList = class ControlMultiSelectList extends (
 					.concat(this._options)
 					.uniqBy((opt) => opt.value);
 				this.set_selectable_items(this._options);
+				this.$filter_input.trigger("focus");
 			});
 		});
 
@@ -126,6 +157,14 @@ frappe.ui.form.ControlMultiSelectList = class ControlMultiSelectList extends (
 	clear_all_selections() {
 		this.values = [];
 		this._selected_values = [];
+		this.update_status();
+		this.set_selectable_items(this._options);
+		this.parse_validate_and_set_in_model("");
+	}
+
+	select_all_options() {
+		this.values = this._options.map((opt) => opt.value);
+		this._selected_values = this._options.slice();
 		this.update_status();
 		this.set_selectable_items(this._options);
 		this.parse_validate_and_set_in_model("");
@@ -254,7 +293,7 @@ frappe.ui.form.ControlMultiSelectList = class ControlMultiSelectList extends (
 					<strong>${option.label}</strong>
 					<div class="small">${option.description}</div>
 				</div>
-				<div class="multiselect-check">${frappe.utils.icon("tick", "xs")}</div>
+				<div class="multiselect-check">${frappe.utils.icon("check", "xs")}</div>
 			</li>`;
 			})
 			.join("");

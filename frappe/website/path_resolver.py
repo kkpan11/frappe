@@ -1,12 +1,12 @@
+import os
 import re
 
-import click
 import werkzeug.routing.exceptions
 from werkzeug.routing import Rule
 
 import frappe
 from frappe.website.page_renderers.document_page import DocumentPage
-from frappe.website.page_renderers.list_page import ListPage
+from frappe.website.page_renderers.list_renderer import ListPage
 from frappe.website.page_renderers.not_found_page import NotFoundPage
 from frappe.website.page_renderers.print_page import PrintPage
 from frappe.website.page_renderers.redirect_page import RedirectPage
@@ -14,7 +14,17 @@ from frappe.website.page_renderers.static_page import StaticPage
 from frappe.website.page_renderers.template_page import TemplatePage
 from frappe.website.page_renderers.web_form import WebFormPage
 from frappe.website.router import evaluate_dynamic_routes
-from frappe.website.utils import can_cache, get_home_page
+from frappe.website.utils import can_cache, check_if_webform_exists, get_home_page
+
+
+def _is_frappe_test_fixture(endpoint: str) -> bool:
+	if endpoint != "_test" and not endpoint.startswith("_test/"):
+		return False
+	www = os.path.join(frappe.get_app_path("frappe"), "www")
+	target = os.path.normpath(os.path.join(www, endpoint))
+	if os.path.commonpath((www, target)) != www:
+		return False
+	return any(os.path.exists(target + suffix) for suffix in ("", ".html", ".md", "/index.html", "/index.md"))
 
 
 class PathResolver:
@@ -31,8 +41,8 @@ class PathResolver:
 			request = frappe.local.request or request
 
 		# WARN: Hardcoded for better performance
-		if self.path == "app" or self.path.startswith("app/"):
-			return "app", TemplatePage("app", self.http_status_code)
+		if self.path == "desk" or self.path.startswith("desk/"):
+			return "desk", TemplatePage("desk", self.http_status_code)
 
 		# check if the request url is in 404 list
 		if request.url and can_cache() and frappe.cache.hget("website_404", request.url):
@@ -43,15 +53,18 @@ class PathResolver:
 		except frappe.Redirect as e:
 			return frappe.flags.redirect_location, RedirectPage(self.path, e.http_status_code)
 
-		if frappe.get_hooks("website_path_resolver"):
-			for handler in frappe.get_hooks("website_path_resolver"):
-				endpoint = frappe.get_attr(handler)(self.path)
+		if website_path_resolvers := frappe.get_hooks("website_path_resolver"):
+			for resolver in website_path_resolvers:
+				endpoint = frappe.get_attr(resolver)(self.path)
 		else:
 			try:
 				endpoint = resolve_path(self.path)
 			except werkzeug.routing.exceptions.RequestRedirect as e:
 				frappe.flags.redirect_location = e.new_url
 				return frappe.flags.redirect_location, RedirectPage(e.new_url, e.code)
+
+		if not (frappe.conf.developer_mode or frappe.conf.allow_tests) and _is_frappe_test_fixture(endpoint):
+			return endpoint, NotFoundPage(endpoint)
 
 		custom_renderers = self.get_custom_page_renderers()
 		renderers = [
@@ -60,8 +73,8 @@ class PathResolver:
 			WebFormPage,
 			DocumentPage,
 			TemplatePage,
-			ListPage,
 			PrintPage,
+			ListPage,
 		]
 
 		for renderer in renderers:
@@ -77,6 +90,8 @@ class PathResolver:
 
 	@staticmethod
 	def get_custom_page_renderers():
+		import click
+
 		custom_renderers = []
 		for renderer_path in frappe.get_hooks("page_renderer") or []:
 			try:
@@ -115,11 +130,21 @@ def resolve_redirect(path, query_string=None):
 	                ]
 	"""
 
+	def raise_redirect(redirect_location, status_code=301, forward_query_params=False):
+		if forward_query_params and query_string:
+			separator = "&" if "?" in redirect_location else "?"
+			redirect_location += separator + frappe.safe_decode(query_string)
+		frappe.flags.redirect_location = redirect_location
+		raise frappe.Redirect(status_code)
+
 	redirect_to = frappe.cache.hget("website_redirects", path or "/")
 	if redirect_to:
 		if isinstance(redirect_to, dict):
-			frappe.flags.redirect_location = redirect_to["path"]
-			raise frappe.Redirect(redirect_to["status_code"])
+			raise_redirect(
+				redirect_to["path"],
+				redirect_to.get("status_code", 301),
+				redirect_to.get("forward_query_parameters", False),
+			)
 		frappe.flags.redirect_location = redirect_to
 		raise frappe.Redirect
 
@@ -128,7 +153,12 @@ def resolve_redirect(path, query_string=None):
 
 	redirects = frappe.get_hooks("website_redirects")
 	redirects += [
-		{"source": r.source, "target": r.target, "redirect_http_status": r.redirect_http_status}
+		{
+			"source": r.source,
+			"target": r.target,
+			"redirect_http_status": r.redirect_http_status,
+			"forward_query_parameters": r.get("forward_query_parameters"),
+		}
 		for r in (frappe.get_website_settings("route_redirects") or [])
 	]
 
@@ -148,12 +178,19 @@ def resolve_redirect(path, query_string=None):
 
 		if match:
 			redirect_to = re.sub(pattern, rule["target"], path_to_match)
-			frappe.flags.redirect_location = redirect_to
 			status_code = rule.get("redirect_http_status") or 301
+
 			frappe.cache.hset(
-				"website_redirects", path_to_match or "/", {"path": redirect_to, "status_code": status_code}
+				"website_redirects",
+				path_to_match or "/",
+				{
+					"path": redirect_to,
+					"status_code": status_code,
+					"forward_query_parameters": rule.get("forward_query_parameters"),
+				},
 			)
-			raise frappe.Redirect(status_code)
+
+			raise_redirect(redirect_to, status_code, rule.get("forward_query_parameters"))
 
 	frappe.cache.hset("website_redirects", path_to_match or "/", False)
 
@@ -196,7 +233,7 @@ def get_website_rules():
 
 		return rules
 
-	if frappe.local.dev_server:
+	if frappe._dev_server:
 		# dont cache in development
 		return _get()
 

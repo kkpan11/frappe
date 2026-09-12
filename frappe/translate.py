@@ -18,8 +18,10 @@ from contextlib import contextmanager, suppress
 from csv import reader, writer
 
 import frappe
+from frappe.app_state import filter_out_disabled_doctypes
 from frappe.query_builder import DocType, Field
-from frappe.utils import cstr, get_bench_path, is_html, strip, strip_html_tags, unique
+from frappe.utils import cstr, get_bench_path, get_build_version, is_html, strip, strip_html_tags, unique
+from frappe.utils.caching import http_cache
 
 REPORT_TRANSLATE_PATTERN = re.compile('"([^:,^"]*):')
 CSV_STRIP_WHITESPACE_PATTERN = re.compile(r"{\s?([0-9]+)\s?}")
@@ -28,6 +30,7 @@ CSV_STRIP_WHITESPACE_PATTERN = re.compile(r"{\s?([0-9]+)\s?}")
 # Cache keys
 MERGED_TRANSLATION_KEY = "merged_translations"
 USER_TRANSLATION_KEY = "lang_user_translations"
+TRANSLATION_VERSION_KEY = "translation_version"
 
 
 def get_language(lang_list: list | None = None) -> str:
@@ -132,14 +135,14 @@ def get_messages_for_boot():
 	return get_all_translations(frappe.local.lang)
 
 
-@frappe.whitelist(allow_guest=True)
-def get_app_translations():
-	if frappe.session.user != "Guest":
-		language = frappe.db.get_value("User", frappe.session.user, "language")
-	else:
-		language = frappe.db.get_single_value("System Settings", "language")
+@frappe.whitelist(allow_guest=True, methods=["GET"])
+@http_cache(max_age=31536000)
+def get_boot_translations(lang: str | None = None) -> dict[str, str]:
+	"""Return all translations for the current user's language."""
+	if lang and lang not in get_all_languages():
+		lang = None
 
-	return get_all_translations(language)
+	return get_all_translations(lang or frappe.local.lang)
 
 
 def get_all_translations(lang: str) -> dict[str, str]:
@@ -210,6 +213,10 @@ def get_translation_dict_from_file(path, lang, app, throw=False) -> dict[str, st
 		csv_content = read_csv_file(path)
 
 		for item in csv_content:
+			if len(item) in [2, 3]:
+				item[0] = item[0].replace("\\n", "\n")
+				item[1] = item[1].replace("\\n", "\n")
+
 			if len(item) == 3 and item[2]:
 				key = item[0] + ":" + item[2]
 				translation_map[key] = strip(item[1])
@@ -247,6 +254,21 @@ def clear_cache():
 	frappe.cache.delete_value(
 		keys=["bootinfo", USER_TRANSLATION_KEY, MERGED_TRANSLATION_KEY],
 	)
+	change_translation_version()
+
+
+def get_translation_version() -> str:
+	"""Return the current translation version from cache."""
+	version = frappe.cache.get_value(TRANSLATION_VERSION_KEY)
+	if version is None:
+		version = frappe.generate_hash(length=8)
+		frappe.cache.set_value(TRANSLATION_VERSION_KEY, version)
+	return f"{version}_{get_build_version()}"
+
+
+def change_translation_version():
+	"""Generate a new random translation version to invalidate browser caches."""
+	frappe.cache.set_value(TRANSLATION_VERSION_KEY, frappe.generate_hash(length=8))
 
 
 def get_messages_for_app(app, deduplicate=True):
@@ -335,6 +357,9 @@ def get_messages_from_doctype(name):
 
 		if d.fieldtype == "Select" and d.options:
 			options = d.options.split("\n")
+			# for workflow state, we don't want to translate the icon(css classnames)
+			if d.fieldname == "icon" and name == "Workflow State":
+				continue
 			if "icon" not in options[0]:
 				messages.extend(options)
 		if d.fieldtype == "HTML" and d.options:
@@ -360,7 +385,6 @@ def get_messages_from_doctype(name):
 
 
 def get_messages_from_workflow(doctype=None, app_name=None):
-	assert doctype or app_name, "doctype or app_name should be provided"
 	from frappe.gettext.extractors.utils import is_translatable
 
 	# translations for Workflows
@@ -626,7 +650,7 @@ def extract_messages_from_python_code(code: str) -> list[tuple[int, str, str | N
 
 	for message in extract_python(
 		io.BytesIO(code.encode()),
-		keywords=["_", "_lt"],
+		keywords=["_", "_lt", "N_"],
 		comment_tags=(),
 		options={},
 	):
@@ -695,9 +719,9 @@ def write_csv_file(path, app_messages, lang_dict):
 			if len(app_message) == 2:
 				path, message = app_message
 			elif len(app_message) == 3:
-				path, message, lineno = app_message
+				path, message, _lineno = app_message
 			elif len(app_message) == 4:
-				path, message, context, lineno = app_message
+				path, message, context, _lineno = app_message
 			else:
 				continue
 
@@ -810,7 +834,6 @@ def migrate_translations(source_app, target_app):
 	"""Migrate target-app-specific translations from source-app to target-app"""
 	strings_in_source_app = [m[1] for m in frappe.translate.get_messages_for_app(source_app)]
 	strings_in_target_app = [m[1] for m in frappe.translate.get_messages_for_app(target_app)]
-
 	strings_in_target_app_but_not_in_source_app = list(
 		set(strings_in_target_app) - set(strings_in_source_app)
 	)
@@ -890,11 +913,11 @@ def deduplicate_messages(messages):
 
 
 @frappe.whitelist()
-def update_translations_for_source(source=None, translation_dict=None):
+def update_translations_for_source(source: str | None = None, translation_dict: str | dict | None = None):
 	if not (source and translation_dict):
 		return
 
-	translation_dict = json.loads(translation_dict)
+	translation_dict = frappe.parse_json(translation_dict)
 
 	if is_html(source):
 		source = strip_html_tags(source)
@@ -950,7 +973,7 @@ def get_translated_doctypes():
 	custom_dts = frappe.get_all(
 		"Property Setter", {"property": "translated_doctype", "value": "1"}, pluck="doc_type"
 	)
-	return unique(dts + custom_dts)
+	return filter_out_disabled_doctypes(unique(dts + custom_dts))
 
 
 @contextmanager
@@ -971,17 +994,20 @@ def print_language(language: str):
 
 	# remember original values
 	_lang = frappe.local.lang
-	_jenv = frappe.local.jenv
+	_jenv_restricted = getattr(frappe.local, "jenv_restricted", None)
+	_jenv_unrestricted = getattr(frappe.local, "jenv_unrestricted", None)
 
 	# set language, empty any existing lang_full_dict and jenv
 	frappe.local.lang = language
-	frappe.local.jenv = None
+	frappe.local.jenv_restricted = None
+	frappe.local.jenv_unrestricted = None
 
 	yield
 
 	# restore original values
 	frappe.local.lang = _lang
-	frappe.local.jenv = _jenv
+	frappe.local.jenv_restricted = _jenv_restricted
+	frappe.local.jenv_unrestricted = _jenv_unrestricted
 
 
 # Backward compatibility

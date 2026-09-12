@@ -3,8 +3,11 @@
 
 frappe.ui.form.on("DocType", {
 	onload: function (frm) {
-		if (frm.is_new() && !frm.doc?.fields) {
-			frappe.listview_settings["DocType"].new_doctype_dialog();
+		if (frm.is_new()) {
+			frm.set_value("allow_auto_repeat", 0);
+			if (!frm.doc?.fields) {
+				frappe.listview_settings["DocType"].new_doctype_dialog();
+			}
 		}
 		frm.call("check_pending_migration");
 	},
@@ -47,6 +50,7 @@ frappe.ui.form.on("DocType", {
 			frm.toggle_enable("custom", 0);
 			frm.toggle_enable("is_virtual", 0);
 			frm.toggle_enable("beta", 0);
+			frm.toggle_enable("deprecated", 0);
 		}
 
 		if (!frm.is_new() && !frm.doc.istable) {
@@ -54,11 +58,11 @@ frappe.ui.form.on("DocType", {
 				? __("Go to {0}", [__(frm.doc.name)])
 				: __("Go to {0} List", [__(frm.doc.name)]);
 			frm.add_custom_button(button_text, () => {
-				window.open(`/app/${frappe.router.slug(frm.doc.name)}`);
+				window.open(`/desk/${frappe.router.slug(frm.doc.name)}`);
 			});
 		}
 
-		const customize_form_link = `<a href="/app/customize-form">${__("Customize Form")}</a>`;
+		const customize_form_link = `<a href="/desk/customize-form">${__("Customize Form")}</a>`;
 		if (!frappe.boot.developer_mode && !frm.doc.custom) {
 			// make the document read-only
 			frm.set_read_only();

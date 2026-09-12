@@ -6,7 +6,6 @@ import frappe
 common_default_keys = ["__default", "__global"]
 
 doctypes_for_mapping = {
-	"Energy Point Rule",
 	"Assignment Rule",
 	"Milestone Tracker",
 	"Document Naming Rule",
@@ -40,6 +39,16 @@ global_cache_keys = (
 	"wkhtmltopdf_version",
 	"domain_restricted_doctypes",
 	"domain_restricted_pages",
+	# hash of per-module sidebar bases; `on_module_content_changed` busts single fields, this
+	# is the escape hatch for anything that changed a module's contents behind doc_events' back
+	"sidebar_computed_base",
+	# Which layers the dock holds. The document's own `on_update` and `on_trash` invalidate this
+	# on every ordinary write; it is listed here for writes that never reach a document, such as
+	# a bulk insert, a restore or an import. A stale entry only costs a lookup that finds nothing,
+	# but a missing one hides a layer someone saved, so `bench clear-cache` has to reach it. The
+	# sidebar's layers need no equivalent: they are read per request for the user asking and
+	# cached nowhere.
+	"dock_layers",
 	"information_schema:counts",
 	"db_tables",
 	"server_script_autocompletion_items",
@@ -61,6 +70,7 @@ user_cache_keys = (
 	"user_perm_can_read",
 	"has_role:Page",
 	"has_role:Report",
+	"allowed_dashboards",
 	"desk_sidebar_items",
 	"contacts",
 )
@@ -106,7 +116,8 @@ def clear_global_cache():
 
 	clear_doctype_cache()
 	clear_website_cache()
-	frappe.cache.delete_value(global_cache_keys + bench_cache_keys)
+	frappe.cache.delete_value(global_cache_keys)
+	frappe.cache.delete_value(bench_cache_keys, shared=True)
 	frappe.setup_module_map()
 
 
@@ -120,6 +131,12 @@ def clear_defaults_cache(user=None):
 
 def clear_doctype_cache(doctype=None):
 	clear_controller_cache(doctype)
+	frappe.client_cache.erase_persistent_caches(doctype=doctype)
+
+	if doctype:
+		frappe.local.valid_columns.pop(doctype, None)
+	else:
+		frappe.local.valid_columns = {}
 
 	_clear_doctype_cache_from_redis(doctype)
 	if hasattr(frappe.db, "after_commit"):
@@ -147,17 +164,26 @@ def _clear_doctype_cache_from_redis(doctype: str | None = None):
 		clear_single(doctype)
 
 		# clear all parent doctypes
-		for dt in frappe.get_all(
-			"DocField", "parent", dict(fieldtype=["in", frappe.model.table_fields], options=doctype)
-		):
-			clear_single(dt.parent)
-
-		# clear all parent doctypes
-		if not frappe.flags.in_install:
+		try:
 			for dt in frappe.get_all(
-				"Custom Field", "dt", dict(fieldtype=["in", frappe.model.table_fields], options=doctype)
+				"DocField",
+				"parent",
+				dict(fieldtype=["in", frappe.model.table_fields], options=doctype),
+				ignore_ddl=True,
 			):
-				clear_single(dt.dt)
+				clear_single(dt.parent)
+
+			# clear all parent doctypes
+			if not frappe.flags.in_install:
+				for dt in frappe.get_all(
+					"Custom Field",
+					"dt",
+					dict(fieldtype=["in", frappe.model.table_fields], options=doctype),
+					ignore_ddl=True,
+				):
+					clear_single(dt.dt)
+		except frappe.DoesNotExistError:
+			pass  # core doctypes getting migrated.
 
 		# clear all notifications
 		delete_notification_count_for(doctype)
@@ -173,13 +199,17 @@ def _clear_doctype_cache_from_redis(doctype: str | None = None):
 	frappe.cache.delete_value(to_del)
 
 
-def clear_controller_cache(doctype=None):
+def clear_controller_cache(doctype=None, *, site=None):
 	if not doctype:
-		frappe.controllers.pop(frappe.local.site, None)
+		frappe.controllers.pop(site or frappe.local.site, None)
+		frappe.lazy_controllers.pop(site or frappe.local.site, None)
 		return
 
-	if site_controllers := frappe.controllers.get(frappe.local.site):
+	if site_controllers := frappe.controllers.get(site or frappe.local.site):
 		site_controllers.pop(doctype, None)
+
+	if lazy_site_controllers := frappe.lazy_controllers.get(site or frappe.local.site):
+		lazy_site_controllers.pop(doctype, None)
 
 
 def get_doctype_map(doctype, name, filters=None, order_by=None):
@@ -279,9 +309,11 @@ def clear_cache(user: str | None = None, doctype: str | None = None):
 		for key in frappe.get_hooks("persistent_cache_keys"):
 			keys_to_delete.difference_update(frappe.cache.get_keys(key))
 		frappe.cache.delete_value(list(keys_to_delete), make_keys=False)
+		frappe.cache.delete_value(bench_cache_keys, shared=True)
 
 		reset_metadata_version()
 		frappe.local.cache = {}
+		frappe.local.valid_columns = {}
 		frappe.local.new_doc_templates = {}
 
 		for fn in frappe.get_hooks("clear_cache"):

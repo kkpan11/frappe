@@ -14,6 +14,7 @@ frappe.ui.FieldSelect = class FieldSelect {
 		this.input_class && this.$input.addClass(this.input_class);
 		this.select_input = this.$input.get(0);
 		this.awesomplete = new Awesomplete(this.select_input, {
+			tabSelect: true,
 			minChars: 0,
 			maxItems: 99,
 			autoFirst: true,
@@ -117,6 +118,10 @@ frappe.ui.FieldSelect = class FieldSelect {
 		// main table
 		var main_table_fields = std_filters.concat(frappe.meta.docfield_list[me.doctype]);
 		$.each(frappe.utils.sort(main_table_fields, "label", "string"), function (i, df) {
+			if (df.is_virtual) {
+				return;
+			}
+
 			let doctype =
 				frappe.get_meta(me.doctype).istable && me.parent_doctype
 					? me.parent_doctype
@@ -128,7 +133,7 @@ frappe.ui.FieldSelect = class FieldSelect {
 
 		// child tables
 		$.each(me.table_fields, function (i, table_df) {
-			if (table_df.options) {
+			if (table_df.options && !table_df.is_virtual) {
 				let child_table_fields = [].concat(frappe.meta.docfield_list[table_df.options]);
 
 				if (table_df.fieldtype === "Table MultiSelect") {
@@ -146,13 +151,13 @@ frappe.ui.FieldSelect = class FieldSelect {
 
 					// show fields where user has read access and if report hide flag is not set
 					if (frappe.perm.has_perm(doctype, df.permlevel, "read"))
-						me.add_field_option(df);
+						me.add_field_option(df, table_df);
 				});
 			}
 		});
 	}
 
-	add_field_option(df) {
+	add_field_option(df, table_df) {
 		let me = this;
 
 		if (df.fieldname == "docstatus" && !frappe.model.is_submittable(me.doctype)) return;
@@ -169,7 +174,8 @@ frappe.ui.FieldSelect = class FieldSelect {
 			label = __(df.label, null, df.parent);
 			table = me.doctype;
 		} else {
-			label = __(df.label, null, df.parent) + " (" + __(df.parent) + ")";
+			const suffix = table_df && table_df.label ? __(table_df.label) : __(df.parent);
+			label = __(df.label, null, df.parent) + " (" + suffix + ")";
 			table = df.parent;
 		}
 

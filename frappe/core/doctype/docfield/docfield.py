@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class DocField(Document):
+	_DOCTYPE_NAME = "DocField"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -14,10 +16,12 @@ class DocField(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
+		alignment: DF.Literal["", "Left", "Center", "Right"]
 		allow_bulk_edit: DF.Check
 		allow_in_quick_entry: DF.Check
 		allow_on_submit: DF.Check
 		bold: DF.Check
+		button_color: DF.Literal["", "Default", "Primary", "Info", "Success", "Warning", "Danger"]
 		collapsible: DF.Check
 		collapsible_depends_on: DF.Code | None
 		columns: DF.Int
@@ -32,6 +36,7 @@ class DocField(Document):
 			"Autocomplete",
 			"Attach",
 			"Attach Image",
+			"Attachment Gallery",
 			"Barcode",
 			"Button",
 			"Check",
@@ -78,9 +83,11 @@ class DocField(Document):
 		hide_days: DF.Check
 		hide_seconds: DF.Check
 		ignore_user_permissions: DF.Check
+		ignore_versioning: DF.Check
 		ignore_xss_filter: DF.Check
 		in_filter: DF.Check
 		in_global_search: DF.Check
+		in_import_template: DF.Check
 		in_list_view: DF.Check
 		in_preview: DF.Check
 		in_standard_filter: DF.Check
@@ -90,7 +97,10 @@ class DocField(Document):
 		link_filters: DF.JSON | None
 		make_attachment_public: DF.Check
 		mandatory_depends_on: DF.Code | None
+		mask: DF.Check
 		max_height: DF.Data | None
+		max_value: DF.Float
+		min_value: DF.Float
 		no_copy: DF.Check
 		non_negative: DF.Check
 		not_nullable: DF.Check
@@ -114,6 +124,7 @@ class DocField(Document):
 		search_index: DF.Check
 		set_only_once: DF.Check
 		show_dashboard: DF.Check
+		show_description_on_click: DF.Check
 		show_on_timeline: DF.Check
 		sort_options: DF.Check
 		sticky: DF.Check
@@ -124,7 +135,6 @@ class DocField(Document):
 
 	def get_link_doctype(self):
 		"""Return the Link doctype for the `docfield` (if applicable).
-
 		* If fieldtype is Link: Return "options".
 		* If fieldtype is Table MultiSelect: Return "options" of the Link field in the Child Table.
 		"""

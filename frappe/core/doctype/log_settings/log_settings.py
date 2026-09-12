@@ -7,7 +7,8 @@ import frappe
 from frappe import _
 from frappe.model.base_document import get_controller
 from frappe.model.document import Document
-from frappe.utils import cint
+from frappe.query_builder import Table
+from frappe.utils import add_days, cint, now_datetime
 from frappe.utils.caching import site_cache
 
 
@@ -29,6 +30,8 @@ def _supports_log_clearing(doctype: str) -> bool:
 
 
 class LogSettings(Document):
+	_DOCTYPE_NAME = "Log Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -123,15 +126,15 @@ def has_unseen_error_log():
 		return {
 			"show_alert": True,
 			"message": _("You have unseen {0}").format(
-				'<a href="/app/List/Error%20Log/List"> Error Logs </a>'
+				'<a href="/desk/List/Error%20Log/List"> Error Logs </a>'
 			),
 		}
 
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def get_log_doctypes(doctype, txt, searchfield, start, page_len, filters):
-	filters = filters or {}
+def get_log_doctypes(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: list):
+	filters = filters or []
 
 	filters.extend(
 		[
@@ -147,17 +150,6 @@ def get_log_doctypes(doctype, txt, searchfield, start, page_len, filters):
 	return supported_doctypes[start:page_len]
 
 
-LOG_DOCTYPES = [
-	"Scheduled Job Log",
-	"Activity Log",
-	"Route History",
-	"Email Queue",
-	"Email Queue Recipient",
-	"Error Log",
-	"OAuth Bearer Token",
-]
-
-
 def clear_log_table(doctype, days=90):
 	"""If any logtype table grows too large then clearing it with DELETE query
 	is not feasible in reasonable time. This command copies recent data to new
@@ -167,26 +159,38 @@ def clear_log_table(doctype, days=90):
 	"""
 	from frappe.utils import get_table_name
 
-	if doctype not in LOG_DOCTYPES:
+	if doctype not in frappe.get_hooks("default_log_clearing_doctypes", {}):
 		raise frappe.ValidationError(f"Unsupported logging DocType: {doctype}")
 
 	original = get_table_name(doctype)
 	temporary = f"{original} temp_table"
 	backup = f"{original} backup_table"
 
-	try:
-		frappe.db.sql_ddl(f"CREATE TABLE `{temporary}` LIKE `{original}`")
+	original_table = Table(original)
+	cutoff = add_days(now_datetime(), -cint(days))
+	copy_recent_rows = (
+		frappe.qb.into(Table(temporary))
+		.from_(original_table)
+		.select("*")
+		.where(original_table.creation > cutoff)
+	)
 
-		# Copy all recent data to new table
-		frappe.db.sql(
-			f"""INSERT INTO `{temporary}`
-				SELECT * FROM `{original}`
-				WHERE `{original}`.`creation` > NOW() - INTERVAL '{days}' DAY"""
-		)
-		frappe.db.sql_ddl(f"RENAME TABLE `{original}` TO `{backup}`, `{temporary}` TO `{original}`")
+	try:
+		if frappe.db.db_type == "postgres":
+			frappe.db.sql_ddl(f'CREATE TABLE "{temporary}" (LIKE "{original}" INCLUDING ALL)')
+
+			copy_recent_rows.run()
+			frappe.db.sql_ddl(f'ALTER TABLE "{original}" RENAME TO "{backup}"')
+			frappe.db.sql_ddl(f'ALTER TABLE "{temporary}" RENAME TO "{original}"')
+		elif frappe.db.db_type == "mariadb":
+			frappe.db.sql_ddl(f"CREATE TABLE `{temporary}` LIKE `{original}`")
+
+			copy_recent_rows.run()
+			frappe.db.sql_ddl(f"RENAME TABLE `{original}` TO `{backup}`, `{temporary}` TO `{original}`")
 	except Exception:
 		frappe.db.rollback()
 		frappe.db.sql_ddl(f"DROP TABLE IF EXISTS `{temporary}`")
 		raise
 	else:
 		frappe.db.sql_ddl(f"DROP TABLE `{backup}`")
+		frappe.db.commit()

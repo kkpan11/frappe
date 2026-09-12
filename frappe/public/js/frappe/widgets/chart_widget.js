@@ -40,9 +40,13 @@ export default class ChartWidget extends Widget {
 	}
 
 	setup_container() {
+		// The island lives on a node inside the body, so it goes before the body does.
+		this.unmount_island();
 		this.body.empty();
 
-		if (this.chart_doc.type == "Heatmap") {
+		// `type` says how desk draws a chart. An app draws an island, so a
+		// heatmap's forced full width and legend do not apply to it.
+		if (!this.island && this.chart_doc.type == "Heatmap") {
 			this.setup_heatmap_container();
 		}
 
@@ -59,6 +63,11 @@ export default class ChartWidget extends Widget {
 			}px;">${__("No Data")}</div>`
 		);
 		this.empty.hide().appendTo(this.body);
+
+		this.error_state = $(
+			`<div class="chart-loading-state text-danger" style="height: ${this.height}px;"></div>`
+		);
+		this.error_state.hide().appendTo(this.body);
 
 		this.chart_wrapper = $(`<div></div>`);
 		this.chart_wrapper.appendTo(this.body);
@@ -89,6 +98,8 @@ export default class ChartWidget extends Widget {
 
 	make_chart() {
 		this.get_settings().then(() => {
+			if (this.island) return this.make_island();
+
 			if (!this.settings) {
 				this.deleted = true;
 				this.widget.remove();
@@ -113,6 +124,111 @@ export default class ChartWidget extends Widget {
 				() => this.fetch_and_update_chart(),
 			]);
 		});
+	}
+
+	/**
+	 * Draws a chart an app owns. Desk keeps the frame, which is the title, the
+	 * actions and the error state. The island owns the body alone, so a workspace
+	 * still reads as a workspace.
+	 *
+	 * Nothing below this fetches chart data. Desk does not know what the island
+	 * draws, and the props came with the document.
+	 */
+	make_island() {
+		this.setup_container();
+
+		if (!this.in_customize_mode) {
+			this.action_area.empty();
+		}
+		this.prepare_island_actions([]);
+
+		// A definite height, not a floor. An island fills the element it is given.
+		// A `height: 100%` inside it resolves against auto to nothing, so a floor
+		// puts the island's header over an empty body. Desk's own chart takes the
+		// same number as a fixed height.
+		this.chart_wrapper.css("height", `${this.height}px`);
+
+		this.island_handle = frappe.ui.mount_island(this.island.name, this.chart_wrapper, {
+			...this.island.props,
+			// The island reports its actions as it loads them, and again whenever
+			// they change. It reports no title, because desk heads the widget with
+			// the chart document's own name.
+			onActions: (actions) => this.prepare_island_actions(actions),
+		});
+
+		this.island_handle.ready.then(
+			() => this.loading.hide(),
+			(error) => this.show_island_error(error)
+		);
+	}
+
+	// the error names a build step: console always, screen only in developer mode
+	show_island_error(error) {
+		console.error(`could not mount the "${this.island.name}" island`, error);
+
+		this.chart_wrapper.hide();
+		this.loading.hide();
+		this.empty.hide();
+		this.error_state.empty().append(
+			frappe.ui.empty_state({
+				icon: "package",
+				title: __("This chart has not been built"),
+				description: frappe.boot.developer_mode
+					? error.message
+					: __("Its assets are missing. Build the app that ships it."),
+			})
+		);
+		this.error_state.show();
+	}
+
+	/**
+	 * The island's own actions, then Edit. Edit is desk's, because the document
+	 * behind the chart is desk's. Every `actions` report calls this again, so the
+	 * menu says what the island says now.
+	 *
+	 * None of desk's other chart actions apply, because they drive a fetch desk
+	 * does not make. Reset Chart clears settings the island never reads. Export
+	 * writes data desk never fetched. The filters and the time interval reach
+	 * nothing. The island reports Refresh itself, if a reload means anything to it.
+	 *
+	 * An action carries either an `onClick` or an `href`. An `href` leads out of
+	 * the app, and desk opens it in a new tab.
+	 *
+	 * @param {{ label: string, icon?: string, onClick?: Function, href?: string }[]} actions
+	 */
+	prepare_island_actions(actions) {
+		// Customize mode owns the action area and puts its own controls there.
+		if (this.in_customize_mode) return;
+
+		// `set_chart_actions` appends a menu. A rebuild replaces the one it made.
+		this.chart_actions?.remove();
+
+		this.set_chart_actions([
+			...(actions || []).map((action, i) => ({
+				label: action.label,
+				action: `island-action-${i}`,
+				handler: action.href
+					? () => window.open(action.href, "_blank")
+					: () => action.onClick(),
+			})),
+			{
+				label: __("Edit"),
+				action: "action-edit",
+				handler: () => {
+					frappe.set_route("Form", "Dashboard Chart", this.chart_doc.name);
+				},
+			},
+		]);
+	}
+
+	/** Releases the island the body holds, if any. Safe to call at any time. */
+	unmount_island() {
+		this.island_handle?.unmount();
+		this.island_handle = null;
+	}
+
+	destroy() {
+		this.unmount_island();
 	}
 
 	render_time_series_filters() {
@@ -311,6 +427,46 @@ export default class ChartWidget extends Widget {
 					this.make_chart();
 				},
 			},
+			{
+				label: __("Export"),
+				action: "action-export",
+				handler: () => {
+					const data = [[this.chart_doc.chart_name]];
+					data.push([]);
+					data.push([]);
+
+					const datasets = this.data?.datasets || [];
+					const labels = (this.data?.labels || []).map((label) => label || "None");
+					if (datasets.length > 1) {
+						const csv_labels = [];
+						const csv_values = [];
+						labels.forEach((label, idx) => {
+							datasets.forEach((element) => {
+								csv_labels.push(`${element.name} (${label})`);
+								const values = element.values || [];
+								if (idx < values.length) {
+									csv_values.push(values[idx]);
+								} else {
+									csv_values.push("");
+								}
+							});
+						});
+						data.push(["", ...csv_labels]);
+						data.push(["", ...csv_values]);
+					} else if (datasets.length === 1) {
+						datasets.forEach((element) => {
+							const values = element.values || [];
+							if (values.length > 0) {
+								data.push(["", ...labels]);
+								data.push(["", ...values]);
+							}
+						});
+					} else {
+						data.push(["", ...labels]);
+					}
+					frappe.tools.downloadify(data, null, this.chart_doc.chart_name);
+				},
+			},
 		];
 
 		if (this.chart_doc.document_type) {
@@ -341,7 +497,7 @@ export default class ChartWidget extends Widget {
 
 		this.filter_button = $(
 			`<div class="filter-chart btn btn-xs pull-right">
-				${frappe.utils.icon("filter", "sm")}
+				${frappe.utils.icon("funnel", "sm")}
 			</div>`
 		);
 
@@ -466,7 +622,7 @@ export default class ChartWidget extends Widget {
 				class="btn btn-xs btn-secondary chart-menu"
 			>
 				<svg class="icon icon-sm">
-					<use href="#icon-dot-horizontal">
+					<use href="#icon-ellipsis">
 					</use>
 				</svg>
 			</button>
@@ -474,9 +630,9 @@ export default class ChartWidget extends Widget {
 				${actions
 					.map(
 						(action) =>
-							`<li><a class="dropdown-item" data-action="${action.action}">${__(
-								action.label
-							)}</a></li>`
+							`<li><a class="dropdown-item" data-action="${
+								action.action
+							}">${frappe.utils.escape_html(__(action.label))}</a></li>`
 					)
 					.join("")}
 			</ul>
@@ -486,7 +642,9 @@ export default class ChartWidget extends Widget {
 
 		this.chart_actions.find("a[data-action]").each((i, o) => {
 			const action = o.dataset.action;
-			$(o).click(actions.find((a) => a.action === action));
+			// Bind the handler, not the action object. jQuery binds whatever it is
+			// given and throws on click when that is not a function.
+			$(o).click(actions.find((a) => a.action === action).handler);
 		});
 		this.chart_actions.appendTo(this.action_area);
 	}
@@ -512,7 +670,18 @@ export default class ChartWidget extends Widget {
 				heatmap_year: args && args.heatmap_year ? args.heatmap_year : null,
 			};
 		}
-		return frappe.xcall(method, args);
+		return frappe.xcall(method, args, undefined, {
+			silent: true,
+			error: (err) => {
+				const message = JSON.parse(JSON.parse(err._server_messages)[0])?.message;
+				this.chart_wrapper.hide();
+				this.loading.hide();
+				this.$summary && this.$summary.hide();
+				this.empty.hide();
+				this.error_state.text(message);
+				this.error_state.show();
+			},
+		});
 	}
 
 	async get_source_doctype() {
@@ -530,7 +699,13 @@ export default class ChartWidget extends Widget {
 		let setup_dashboard_chart = () => {
 			const chart_args = this.get_chart_args();
 
+			const is_circular_chart = ["Pie", "Donut", "Percentage"].includes(this.chart_doc.type);
+
 			if (!this.dashboard_chart) {
+				this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
+			} else if (is_circular_chart) {
+				this.chart_wrapper.empty();
+				delete this.dashboard_chart;
 				this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
 			} else {
 				this.dashboard_chart.update(this.data);
@@ -542,9 +717,11 @@ export default class ChartWidget extends Widget {
 			this.loading.hide();
 			this.$summary && this.$summary.hide();
 			this.empty.show();
+			this.error_state.hide();
 		} else {
 			this.loading.hide();
 			this.empty.hide();
+			this.error_state.hide();
 			this.chart_wrapper.show();
 			this.chart_doc.document_type = await this.get_source_doctype();
 
@@ -579,6 +756,7 @@ export default class ChartWidget extends Widget {
 			colors: colors,
 			height: this.height,
 			maxSlices: this.chart_doc.number_of_groups || max_slices,
+			truncateLegends: 0,
 			axisOptions: {
 				xIsSeries: this.chart_doc.timeseries,
 				shortenYAxisNumbers: 1,
@@ -629,7 +807,7 @@ export default class ChartWidget extends Widget {
 			chart_args.data.start = new Date(`${heatmap_year}-01-01`);
 			chart_args.data.end = new Date(`${heatmap_year + 1}-01-01`);
 		}
-
+		if (this.chart_doc.show_values_over_chart) chart_args.valuesOverPoints = true;
 		let set_options = (options) => {
 			let custom_options = JSON.parse(options);
 			for (let key in custom_options) {
@@ -775,6 +953,13 @@ export default class ChartWidget extends Widget {
 		return frappe.model.with_doc("Dashboard Chart", this.chart_name).then((chart_doc) => {
 			if (chart_doc) {
 				this.chart_doc = chart_doc;
+
+				// An app draws this chart. When no app does, the key is absent, and
+				// desk's own renderer below runs. Read on every call, because the
+				// document may have changed.
+				this.island = chart_doc.__onload?.island;
+				if (this.island) return Promise.resolve();
+
 				if (this.chart_doc.chart_type == "Custom") {
 					// custom source
 					if (frappe.dashboards.chart_sources[this.chart_doc.source]) {

@@ -8,6 +8,8 @@ from frappe.utils.jinja import validate_template
 
 
 class AddressTemplate(Document):
+	_DOCTYPE_NAME = "Address Template"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -29,7 +31,7 @@ class AddressTemplate(Document):
 
 		if not self.is_default and not self._get_previous_default():
 			self.is_default = 1
-			if frappe.get_system_settings("setup_complete"):
+			if frappe.is_setup_complete():
 				frappe.msgprint(_("Setting this Address Template as default as there is no other default"))
 
 	def on_update(self):

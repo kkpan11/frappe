@@ -2,7 +2,9 @@
 # License: MIT. See LICENSE
 
 import functools
+import importlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -18,16 +20,26 @@ from collections.abc import (
 	Sequence,
 )
 from email.header import decode_header, make_header
-from email.utils import formataddr, parseaddr
-from typing import TypeAlias, TypedDict
+from email.utils import formataddr, getaddresses, parseaddr
+from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypedDict
 
-from werkzeug.test import Client
+import orjson
 
-from frappe.deprecation_dumpster import gzip_compress, gzip_decompress, make_esc
+from frappe.deprecation_dumpster import (
+	get_gravatar,
+	get_gravatar_url,
+	gzip_compress,
+	gzip_decompress,
+	has_gravatar,
+	make_esc,
+)
 
 # utility functions like cint, int, flt, etc.
 from frappe.utils.data import *
-from frappe.utils.html_utils import sanitize_html
+from frappe.utils.html_utils import sanitize_html, sanitize_html_payload
+
+if TYPE_CHECKING:
+	from werkzeug.test import Client
 
 EMAIL_NAME_PATTERN = re.compile(r"[^A-Za-z0-9\u00C0-\u024F\/\_\' ]+")
 EMAIL_STRING_PATTERN = re.compile(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)")
@@ -46,15 +58,6 @@ EMAIL_MATCH_PATTERN = re.compile(
 UNSET = object()
 
 PropertyType: TypeAlias = property | functools.cached_property
-
-
-if sys.version_info < (3, 11):
-
-	def exception():
-		_exc_type, exc_value, _exc_traceback = sys.exc_info()
-		return exc_value
-
-	sys.exception = exception
 
 
 def get_fullname(user=None):
@@ -104,8 +107,10 @@ def get_formatted_email(user, mail=None):
 		return cstr(make_header(decode_header(formataddr((fullname, mail)))))
 
 
-def extract_email_id(email):
+def extract_email_id(email: str) -> str:
 	"""fetch only the email part of the Email Address"""
+	if not email:
+		return ""
 	return cstr(parse_addr(email)[1])
 
 
@@ -141,6 +146,9 @@ def validate_phone_number(phone_number, throw=False):
 	if not phone_number:
 		return False
 
+	if not isinstance(phone_number, str):
+		phone_number = str(phone_number)
+
 	phone_number = phone_number.strip()
 	match = PHONE_NUMBER_PATTERN.match(phone_number)
 
@@ -174,45 +182,50 @@ def validate_name(name, throw=False):
 
 def validate_email_address(email_str, throw=False):
 	"""Validates the email string"""
-	email = email_str = (email_str or "").strip()
 
-	def _check(e):
-		_valid = True
-		if not e:
-			_valid = False
+	email_str = (email_str or "").strip()
+	out = []
 
-		if "undisclosed-recipient" in e:
-			return False
+	# split_emails collapses \n/\r to spaces *before* splitting, so newlines
+	# would no longer act as separators. Convert them to commas up front.
+	email_str = email_str.replace("\n", ",").replace("\r", ",")
 
-		elif " " in e and "<" not in e:
-			# example: "test@example.com test2@example.com" will return "test@example.comtest2" after parseaddr!!!
-			_valid = False
+	# Fast path: parse the whole string in one shot. Strict mode either gives
+	# us all entries cleanly or bails to [('', '')] on malformed input.
+	addresses = getaddresses([email_str])
 
-		else:
-			email_id = extract_email_id(e)
-			match = EMAIL_MATCH_PATTERN.match(email_id) if email_id else None
+	# Slow path: if nothing usable came back, re-parse each piece in isolation
+	# so one malformed entry can't reject its valid neighbours. split_emails
+	# is quote-aware, so `"Last, First" <addr>` survives the split intact.
+	if not any(addr for _, addr in addresses):
+		addresses = []
+		for piece in split_emails(email_str):
+			addresses.extend(getaddresses([piece]))
 
-			if not match:
-				_valid = False
-
-		if not _valid:
+	for name, addr in addresses:
+		if not addr:
 			if throw:
-				invalid_email = frappe.utils.escape_html(e)
 				frappe.throw(
-					frappe._("{0} is not a valid Email Address").format(invalid_email),
+					frappe._("{0} is not a valid Email Address").format(
+						frappe.utils.escape_html(name or email_str)
+					),
 					frappe.InvalidEmailAddressError,
 				)
-			return None
-		else:
-			return email_id
-
-	out = []
-	for e in email_str.split(","):
-		if not e:
 			continue
-		email = _check(e.strip())
-		if email:
-			out.append(email)
+
+		# Skip undisclosed recipients
+		if "undisclosed-recipient" in addr:
+			continue
+
+		if not EMAIL_MATCH_PATTERN.fullmatch(addr):
+			if throw:
+				frappe.throw(
+					frappe._("{0} is not a valid Email Address").format(frappe.utils.escape_html(addr)),
+					frappe.InvalidEmailAddressError,
+				)
+			continue
+
+		out.append(addr)
 
 	return ", ".join(out)
 
@@ -257,69 +270,74 @@ def validate_url(
 	return is_valid
 
 
+def validate_iban(iban: str, throw: bool = False) -> bool:
+	from frappe import _
+
+	valid = is_valid_iban(iban)
+	if not valid and throw:
+		frappe.throw(frappe._("'{0}' is not a valid IBAN").format(frappe.bold(iban)))
+
+	return valid
+
+
+def is_valid_iban(iban: str) -> bool:
+	"""
+	Algorithm: https://en.wikipedia.org/wiki/International_Bank_Account_Number#Validating_the_IBAN
+	"""
+	if not iban:
+		return False
+
+	def encode_char(c):
+		# Position in the alphabet (A=1, B=2, ...) plus nine
+		return str(9 + ord(c) - 64)
+
+	# remove whitespaces, upper case to get the right number from ord()
+	iban = iban.replace(" ", "").upper()
+
+	# Move country code and checksum from the start to the end
+	flipped = iban[4:] + iban[:4]
+
+	# Encode characters as numbers
+	encoded = [encode_char(c) if ord(c) >= 65 and ord(c) <= 90 else c for c in flipped]
+
+	try:
+		to_check = int("".join(encoded))
+	except ValueError:
+		return False
+
+	return to_check % 97 == 1
+
+
 def random_string(length: int) -> str:
 	"""generate a random string"""
+	import secrets
 	import string
-	from random import choice
 
-	return "".join(choice(string.ascii_letters + string.digits) for i in range(length))
-
-
-def has_gravatar(email: str) -> str:
-	"""Return gravatar url if user has set an avatar at gravatar.com."""
-	import requests
-
-	if frappe.flags.in_import or frappe.flags.in_install or frappe.flags.in_test:
-		# no gravatar if via upload
-		# since querying gravatar for every item will be slow
-		return ""
-
-	gravatar_url = get_gravatar_url(email, "404")
-	try:
-		res = requests.get(gravatar_url, timeout=5)
-		if res.status_code == 200:
-			return gravatar_url
-		else:
-			return ""
-	except requests.exceptions.RequestException:
-		return ""
+	alphabet = string.ascii_letters + string.digits
+	return "".join(secrets.choice(alphabet) for i in range(length))
 
 
-def get_gravatar_url(email: str, default: Literal["mm", "404"] = "mm") -> str:
-	"""Return gravatar URL for the given email.
-
-	If `default` is set to "404", gravatar URL will return 404 if no avatar is found.
-	If `default` is set to "mm", a placeholder image will be returned.
-	"""
-	hexdigest = hashlib.md5(frappe.as_unicode(email).encode("utf-8"), usedforsecurity=False).hexdigest()
-	return f"https://secure.gravatar.com/avatar/{hexdigest}?d={default}&s=200"
-
-
-def get_gravatar(email: str) -> str:
-	"""Return gravatar URL if user has set an avatar at gravatar.com.
-
-	Else return identicon image (base64)."""
+def get_identicon(email: str) -> str:
+	"""Return an identicon image (base64) for the given email."""
 	from frappe.utils.identicon import Identicon
 
-	return has_gravatar(email) or Identicon(email).base64()
+	return Identicon(email).base64()
 
 
 def get_traceback(with_context: bool = False) -> str:
 	"""Return the traceback of the Exception."""
 	from traceback_with_variables import iter_exc_lines
 
-	exc = sys.exception()
-	if not exc:
+	exc_type, exc_value, exc_tb = sys.exc_info()
+
+	if not any([exc_type, exc_value, exc_tb]):
 		return ""
 
-	if exc.__cause__:
-		exc = exc.__cause__
-
 	if with_context:
-		trace_list = iter_exc_lines(exc, fmt=_get_traceback_sanitizer())
+		trace_list = iter_exc_lines(fmt=_get_traceback_sanitizer())
 		tb = "\n".join(trace_list)
 	else:
-		trace_list = traceback.format_exception(exc)
+		trace_list = traceback.format_exception(exc_type, exc_value, exc_tb)
 		tb = "".join(cstr(t) for t in trace_list)
 
 	bench_path = get_bench_path() + "/"
@@ -337,14 +355,13 @@ def _get_traceback_sanitizer():
 		"token",
 		"key",
 		"pwd",
+		"client_secret",
 	]
 
 	placeholder = "********"
 
 	def dict_printer(v: dict) -> str:
-		from copy import deepcopy
-
-		v = deepcopy(v)
+		v = v.copy()
 		for key in blocklist:
 			if key in v:
 				v[key] = placeholder
@@ -545,7 +562,7 @@ def get_site_url(site):
 
 def encode_dict(d, encoding="utf-8"):
 	for key in d:
-		if isinstance(d[key], str) and isinstance(d[key], str):
+		if isinstance(d[key], str):
 			d[key] = d[key].encode(encoding)
 
 	return d
@@ -568,7 +585,7 @@ def get_disk_usage():
 	files_path = get_files_path()
 	if not os.path.exists(files_path):
 		return 0
-	err, out = execute_in_shell(f"du -hsm {files_path}")
+	_err, out = execute_in_shell(f"du -hsm {files_path}")
 	return cint(out.split("\n")[-2].split("\t")[0])
 
 
@@ -578,8 +595,10 @@ def touch_file(path):
 	return path
 
 
-def get_test_client(use_cookies=True) -> Client:
+def get_test_client(use_cookies=True) -> "Client":
 	"""Return an test instance of the Frappe WSGI."""
+	from werkzeug.test import Client
+
 	from frappe.app import application
 
 	return Client(application, use_cookies=use_cookies)
@@ -690,12 +709,16 @@ def get_sites(sites_path=None):
 	return sorted(sites)
 
 
-def get_request_session(max_retries=5):
+DEFAULT_MAX_REDIRECTS = 5
+
+
+def get_request_session(max_retries=5, max_redirects=DEFAULT_MAX_REDIRECTS, adapter=None):
 	import requests
 	from requests.adapters import HTTPAdapter, Retry
 
 	session = requests.Session()
-	http_adapter = HTTPAdapter(max_retries=Retry(total=max_retries, status_forcelist=[500]))
+	session.max_redirects = max_redirects
+	http_adapter = adapter or HTTPAdapter(max_retries=Retry(total=max_retries, status_forcelist=[500]))
 
 	session.mount("http://", http_adapter)
 	session.mount("https://", http_adapter)
@@ -778,7 +801,7 @@ def get_installed_apps_info():
 			"version": version_details.get("branch_version") or version_details.get("version"),
 			"branch": version_details.get("branch"),
 		}
-		for app, version_details in get_versions().items()
+		for app, version_details in get_versions(include_disabled=True).items()
 	)
 	return out
 
@@ -807,7 +830,7 @@ def get_site_info():
 	kwargs = {
 		"fields": ["user", "creation", "full_name"],
 		"filters": {"operation": "Login", "status": "Success"},
-		"limit": "10",
+		"limit": 10,
 	}
 
 	site_info = {
@@ -816,7 +839,7 @@ def get_site_info():
 		"country": system_settings.country,
 		"language": system_settings.language or "english",
 		"time_zone": system_settings.time_zone,
-		"setup_complete": cint(system_settings.setup_complete),
+		"setup_complete": frappe.is_setup_complete(),
 		"scheduler_enabled": system_settings.enable_scheduler,
 		# usage
 		"emails_sent": get_emails_sent_this_month(),
@@ -832,18 +855,7 @@ def get_site_info():
 		site_info.update(frappe.get_attr(method_name)(site_info) or {})
 
 	# dumps -> loads to prevent datatype conflicts
-	return json.loads(frappe.as_json(site_info))
-
-
-def parse_json(val: str):
-	"""
-	Parses json if string else return
-	"""
-	if isinstance(val, str):
-		val = json.loads(val)
-	if isinstance(val, dict):
-		val = frappe._dict(val)
-	return val
+	return orjson.loads(frappe.as_json(site_info))
 
 
 def get_db_count(*args):
@@ -864,7 +876,7 @@ def get_db_count(*args):
 	for doctype in args:
 		db_count[doctype] = frappe.db.count(doctype)
 
-	return json.loads(frappe.as_json(db_count))
+	return orjson.loads(frappe.as_json(db_count))
 
 
 def call(fn, *args, **kwargs):
@@ -880,24 +892,23 @@ def call(fn, *args, **kwargs):
 	        via terminal:
 	                bench --site erpnext.local execute frappe.utils.call --args '''["frappe.get_all", "Activity Log"]''' --kwargs '''{"fields": ["user", "creation", "full_name"], "filters":{"Operation": "Login", "Status": "Success"}, "limit": "10"}'''
 	"""
-	return json.loads(frappe.as_json(frappe.call(fn, *args, **kwargs)))
+	return orjson.loads(frappe.as_json(frappe.call(fn, *args, **kwargs)))
 
 
 def get_safe_filters(filters):
 	try:
-		filters = json.loads(filters)
-
-		if isinstance(filters, int | float):
-			filters = frappe.as_unicode(filters)
-
+		parsed = orjson.loads(filters)
 	except (TypeError, ValueError):
-		# filters are not passed, not json
-		pass
+		# not a string, or not valid json
+		return filters
+	# numeric JSON is ambiguous: docnames like "3E002" parse as floats and
+	# would be corrupted by stringifying back, so keep the original string
+	if isinstance(parsed, int | float) and not isinstance(parsed, bool):
+		return filters
+	return parsed
 
-	return filters
 
-
-def create_batch(iterable: Iterable, size: int) -> Generator[Iterable, None, None]:
+def create_batch(iterable: Iterable, size: int) -> Generator[Iterable]:
 	"""Convert an iterable to multiple batches of constant size of batch_size.
 
 	Args:
@@ -909,7 +920,9 @@ def create_batch(iterable: Iterable, size: int) -> Generator[Iterable, None, Non
 	"""
 	total_count = len(iterable)
 	for i in range(0, total_count, size):
-		yield iterable[i : min(i + size, total_count)]
+		batch = iterable[i : min(i + size, total_count)]
+		assert len(batch) <= size, "each batch must not exceed the requested size"
+		yield batch
 
 
 def set_request(**kwargs):
@@ -1019,13 +1032,17 @@ def groupby_metric(iterable: dict[str, list], key: str):
 	"""
 	records = {}
 	for category, items in iterable.items():
-		for item in items:
-			records.setdefault(item[key], {}).setdefault(category, []).append(item)
+		if items:
+			for item in items:
+				records.setdefault(item[key], {}).setdefault(category, []).append(item)
 	return records
 
 
 def get_table_name(table_name: str, wrap_in_backticks: bool = False) -> str:
 	name = f"tab{table_name}" if not table_name.startswith("__") else table_name
+	assert name.startswith(("tab", "__")), (
+		"DB table name must be a 'tab'-prefixed doctype table or a '__' system table"
+	)
 
 	if wrap_in_backticks:
 		return f"`{name}`"
@@ -1045,7 +1062,7 @@ def safe_json_loads(*args):
 
 	for arg in args:
 		try:
-			arg = json.loads(arg)
+			arg = orjson.loads(arg)
 		except Exception:
 			pass
 
@@ -1146,6 +1163,25 @@ class CallbackManager:
 	def reset(self):
 		self._functions.clear()
 
+	def __len__(self) -> int:
+		return len(self._functions)
+
+	def __bool__(self) -> bool:
+		# stay truthy when empty; callers use `if callbacks:` as a None check
+		return True
+
+	def cut(self, count: int) -> list:
+		"""Detach and return the functions queued after the first `count`."""
+		detached = []
+		while len(self._functions) > count:
+			detached.append(self._functions.pop())
+		detached.reverse()
+		return detached
+
+	def truncate(self, count: int) -> None:
+		"""Drop functions queued after the first `count`."""
+		self.cut(count)
+
 
 def safe_eval(code, eval_globals=None, eval_locals=None):
 	"""A safer `eval`"""
@@ -1155,46 +1191,90 @@ def safe_eval(code, eval_globals=None, eval_locals=None):
 	return safe_eval(code, eval_globals, eval_locals)
 
 
-class cached_property(functools.cached_property):
-	"""
-	A simpler `functools.cached_property` implementation without locks.
-	This isn't needed in Python 3.12+, since lock was removed in newer versions.
-	Hence, in those versions, it returns the `functools.cached_property` object.
+def create_folder(path, with_init=False):
+	"""Create a folder in the given path and add an `__init__.py` file (optional).
 
-	This does not prevent a possible race condition in multi-threaded usage.
-	The getter function could run more than once on the same instance,
-	with the latest run setting the cached value. If the cached property is
-	idempotent or otherwise not harmful to run more than once on an instance,
-	this is fine. If synchronization is needed, implement the necessary locking
-	inside the decorated getter function or around the cached property access.
-	"""
+	:param path: Folder path.
+	:param with_init: Create `__init__.py` in the new folder."""
+	from frappe.utils import touch_file
 
-	def __new__(cls, func):
-		if sys.version_info.minor >= 12:
-			return functools.cached_property(func)
+	if not os.path.exists(path):
+		os.makedirs(path)
 
-		return super().__new__(cls)
+		if with_init:
+			touch_file(os.path.join(path, "__init__.py"))
 
-	def __init__(self, func):
-		self.func = func
-		self.attrname = None
-		self.__doc__ = func.__doc__
-		self.__module__ = func.__module__
 
-	def __set_name__(self, owner, name):
-		if self.attrname is None:
-			self.attrname = name
+cached_property = functools.cached_property
 
-		elif name != self.attrname:
-			raise TypeError(
-				"Cannot assign the same cached_property to two different names "
-				f"({self.attrname!r} and {name!r})."
-			)
 
-	def __get__(self, instance, owner=None):
-		if instance is None:
-			return self
+def get_frappe_version() -> str:
+	return getattr(frappe, "__version__", "unknown")
 
-		value = self.func(instance)
-		instance.__dict__[self.attrname] = value
-		return value
+
+def get_app_version(app_name: str) -> str:
+	try:
+		return frappe.get_attr(app_name + ".__version__")
+	except Exception:
+		return "0.0.1"
+
+
+def get_module(modulename: str):
+	"""Return a module object for given Python module name using `importlib.import_module`."""
+	return importlib.import_module(modulename)
+
+
+def read_file(path, raise_not_found=False, as_base64=False):
+	"""Open a file and return its content as Unicode or Base64 string."""
+	if isinstance(path, str):
+		path = path.encode("utf-8")
+
+	if os.path.exists(path):
+		if as_base64:
+			import base64
+
+			with open(path, "rb") as f:
+				return base64.b64encode(f.read()).decode("utf-8")
+		else:
+			with open(path) as f:
+				return as_unicode(f.read())
+	elif raise_not_found:
+		raise OSError(f"{path} Not Found")
+	else:
+		return None
+
+
+def get_file_json(path):
+	"""Read a file and return parsed JSON object."""
+	with open(path) as f:
+		return json.load(f)
+
+
+def get_file_items(path, raise_not_found=False, ignore_empty_lines=True):
+	"""Return items from text file as a list. Ignore empty lines."""
+	content = read_file(path, raise_not_found=raise_not_found)
+	if content:
+		content = strip(content)
+		return [
+			p.strip()
+			for p in content.splitlines()
+			if (not ignore_empty_lines) or (p.strip() and not p.startswith("#"))
+		]
+	return []
+
+
+def get_attr(method_string: str):
+	"""Get python method object from its name."""
+	import frappe
+
+	app_name = method_string.split(".", 1)[0]
+	if (
+		not frappe.local.flags.in_uninstall
+		and not frappe.local.flags.in_install
+		and app_name not in frappe.get_installed_apps()
+	):
+		frappe.throw(frappe._("App {0} is not installed").format(app_name), frappe.AppNotInstalledError)
+
+	modulename = ".".join(method_string.split(".")[:-1])
+	methodname = method_string.split(".")[-1]
+	return getattr(get_module(modulename), methodname)

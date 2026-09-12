@@ -49,7 +49,7 @@ def get_doctypes_with_global_search(with_child_tables=True):
 			if len(meta.get_global_search_fields()) > 0:
 				global_search_doctypes.append(d)
 
-		installed_apps = frappe.get_installed_apps()
+		installed_apps = frappe.get_active_apps()
 		module_app = frappe.local.module_app
 
 		doctypes = [
@@ -166,6 +166,7 @@ def get_selected_fields(meta, global_search_fields):
 	if meta.has_field("is_website_published"):
 		fieldnames.append("is_website_published")
 
+	assert fieldnames, "selected fields must always include an identifier column"
 	return fieldnames
 
 
@@ -219,9 +220,15 @@ def insert_values_for_multiple_docs(all_contents):
 		# ignoring duplicate keys for doctype_name
 		frappe.db.multisql(
 			{
-				"mariadb": """INSERT IGNORE INTO `__global_search`
+				"mariadb": """INSERT INTO `__global_search`
 				(doctype, name, content, published, title, route)
-				VALUES {} """.format(", ".join(batch_values)),
+				VALUES {}
+				ON DUPLICATE KEY UPDATE
+					content=VALUE(content),
+					published=VALUE(published),
+					title=VALUE(title),
+					route=VALUE(route)
+				""".format(", ".join(batch_values)),
 				"postgres": """INSERT INTO `__global_search`
 				(doctype, name, content, published, title, route)
 				VALUES {}
@@ -292,7 +299,7 @@ def update_global_search_for_all_web_pages():
 
 
 def get_routes_to_index():
-	apps = frappe.get_installed_apps()
+	apps = frappe.get_active_apps()
 
 	routes_to_index = []
 	for app in apps:
@@ -376,7 +383,7 @@ def sync_global_search():
 			yield value
 
 	item_generator = get_search_queue_item_generator()
-	while search_items := tuple(islice(item_generator, 10_000)):
+	while search_items := tuple(islice(item_generator, 1000)):
 		values = _get_deduped_search_item_values(search_items)
 		sync_values(values)
 
@@ -391,6 +398,7 @@ def _get_deduped_search_item_values(items):
 		key = (item_dict["doctype"], item_dict["name"])
 		values_dict[key] = tuple(item_dict.values())
 
+	assert len(values_dict) <= len(items), "dedup must not produce more values than input items"
 	return values_dict.values()
 
 
@@ -422,6 +430,7 @@ def sync_value_in_queue(value):
 		frappe.cache.lpush("global_search_queue", json.dumps(value))
 	except redis.exceptions.ConnectionError:
 		# not connected, sync directly
+		assert not frappe.flags.in_test, "Should not fail silently in tests"
 		sync_value(value)
 
 
@@ -470,7 +479,7 @@ def delete_for_document(doc):
 
 
 @frappe.whitelist()
-def search(text, start=0, limit=20, doctype=""):
+def search(text: str, start: int = 0, limit: int = 20, doctype: str = ""):
 	"""
 	Search for given text in __global_search
 	:param text: phrase to be searched
@@ -523,19 +532,20 @@ def search(text, start=0, limit=20, doctype=""):
 			if r.doctype == doctype and r.rank > 0.0:
 				try:
 					meta = frappe.get_meta(r.doctype)
+					doc = frappe.get_lazy_doc(r.doctype, r.name)
 					if meta.image_field:
-						r.image = frappe.db.get_value(r.doctype, r.name, meta.image_field)
+						r.image = doc.get(meta.image_field)
 					if meta.title_field:
-						r.title = frappe.db.get_value(r.doctype, r.name, meta.title_field)
+						r.title = doc.get(meta.title_field)
+					if doc.has_permission():
+						sorted_results.append(r)
 				except Exception:
 					frappe.clear_messages()
-
-				sorted_results.extend([r])
 
 	return sorted_results
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True)  # nosemgrep
 def web_search(text: str, scope: str | None = None, start: int = 0, limit: int = 20):
 	"""
 	Search for given text in __global_search where published = 1
@@ -562,7 +572,9 @@ def web_search(text: str, scope: str | None = None, start: int = 0, limit: int =
 		mariadb_conditions += "MATCH(`content`) AGAINST ({} IN BOOLEAN MODE)".format(
 			frappe.db.escape("+" + text + "*")
 		)
-		postgres_conditions += f'TO_TSVECTOR("content") @@ PLAINTO_TSQUERY({frappe.db.escape(text)})'
+		postgres_conditions += (
+			f"to_tsvector('english', \"content\") @@ plainto_tsquery('english', {frappe.db.escape(text)})"
+		)
 
 		values = {"scope": "".join([scope, "%"]) if scope else "", "limit": limit, "start": start}
 

@@ -42,16 +42,19 @@ def get_decrypted_password(doctype, name, fieldname="password", raise_exception=
 
 			return None
 
-	elif raise_exception:
+	if raise_exception:
 		frappe.throw(
 			_("Password not found for {0} {1} {2}").format(doctype, name, fieldname),
-			frappe.AuthenticationError,
 		)
 
 
 def set_encrypted_password(doctype, name, pwd, fieldname="password"):
 	query = frappe.qb.into(Auth).columns(
 		Auth.doctype, Auth.name, Auth.fieldname, Auth.password, Auth.encrypted
+	)
+
+	assert frappe.db.db_type in ("mariadb", "sqlite", "postgres"), (
+		"exactly one db_type branch must build the insert query"
 	)
 
 	# TODO: Simplify this via aliasing methods in `frappe.qb`
@@ -81,6 +84,24 @@ def remove_encrypted_password(doctype, name, fieldname="password"):
 	frappe.db.delete("__Auth", {"doctype": doctype, "name": name, "fieldname": fieldname})
 
 
+def is_password_reused(user, pwd, doctype="User", fieldname="password"):
+	"""Return True if pwd matches the stored password for user, else False."""
+	result = (
+		frappe.qb.from_(Auth)
+		.select(Auth.password)
+		.where(
+			(Auth.doctype == doctype)
+			& (Auth.name == user)
+			& (Auth.fieldname == fieldname)
+			& (Auth.encrypted == 0)
+		)
+		.limit(1)
+		.run(as_dict=True)
+	)
+
+	return bool(result and passlibctx.verify(pwd, result[0].password))
+
+
 def check_password(user, pwd, doctype="User", fieldname="password", delete_tracker_cache=True):
 	"""Checks if user and password are correct, else raises frappe.AuthenticationError"""
 
@@ -102,6 +123,7 @@ def check_password(user, pwd, doctype="User", fieldname="password", delete_track
 
 	# lettercase agnostic
 	user = result[0].name
+	assert user, "authenticated user name must be non-empty"
 
 	# TODO: This need to be deleted after checking side effects of it.
 	# We have a `LoginAttemptTracker` that can take care of tracking related cache.
@@ -132,6 +154,10 @@ def update_password(user, pwd, doctype="User", fieldname="password", logout_all_
 
 	query = frappe.qb.into(Auth).columns(
 		Auth.doctype, Auth.name, Auth.fieldname, Auth.password, Auth.encrypted
+	)
+
+	assert frappe.db.db_type in ("mariadb", "sqlite", "postgres"), (
+		"exactly one db_type branch must build the insert query"
 	)
 
 	# TODO: Simplify this via aliasing methods in `frappe.qb`
@@ -233,4 +259,8 @@ def get_encryption_key():
 
 
 def get_password_reset_limit():
+	# Signed-in users (e.g. admins triggering reset for others) should not
+	# share the same rate-limit bucket used to throttle anonymous abuse.
+	if "System Manager" in frappe.get_roles():
+		return 1000
 	return frappe.get_system_settings("password_reset_limit") or 3

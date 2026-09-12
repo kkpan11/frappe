@@ -28,6 +28,7 @@ class NamedParameterWrapper:
 		        str: parameter used in the SQL query
 		"""
 		param_key = f"%(param{len(self.parameters) + 1})s"
+		assert param_key[2:-2] not in self.parameters, "generated parameter keys must be unique"
 		self.parameters[param_key[2:-2]] = param_value
 		return param_key
 
@@ -62,6 +63,10 @@ class ParameterizedValueWrapper(ValueWrapper):
 				self.value = format_time(self.value)
 			elif isinstance(self.value, datetime):
 				self.value = frappe.db.format_datetime(self.value)
+			elif isinstance(self.value, bool):
+				# emit '1'/'0': fits both `SET check_field = '1'` (smallint) and
+				# `WHERE ... OR '0'` (a condition), where postgres rejects a bare 1
+				self.value = str(int(self.value))
 
 			sql = self.get_value_sql(
 				quote_char=quote_char,

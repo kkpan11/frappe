@@ -54,6 +54,7 @@ no_value_fields = (
 	"Section Break",
 	"Column Break",
 	"Tab Break",
+	"Attachment Gallery",
 	"HTML",
 	"Table",
 	"Table MultiSelect",
@@ -68,6 +69,7 @@ display_fieldtypes = (
 	"Section Break",
 	"Column Break",
 	"Tab Break",
+	"Attachment Gallery",
 	"HTML",
 	"Button",
 	"Image",
@@ -77,7 +79,7 @@ display_fieldtypes = (
 
 numeric_fieldtypes = ("Currency", "Int", "Long Int", "Float", "Percent", "Check")
 
-data_field_options = ("Email", "Name", "Phone", "URL", "Barcode")
+data_field_options = ("Email", "Name", "Phone", "URL", "Barcode", "IBAN")
 
 default_fields = (
 	"doctype",
@@ -224,7 +226,8 @@ def get_permitted_fields(
 	meta = frappe.get_meta(doctype)
 	valid_columns = meta.get_valid_columns()
 
-	if doctype in CORE_DOCTYPES:
+	# note: any change here should also be made in _get_filterable_fields in query.py
+	if doctype in CORE_DOCTYPES and doctype != "User":
 		return valid_columns
 
 	# DocType has only fields of type Table (Table, Table MultiSelect)
@@ -242,7 +245,7 @@ def get_permitted_fields(
 	)
 
 	if permission_type == "select":
-		return permitted_fields
+		return [*meta.default_fields, *permitted_fields]
 
 	valid_columns = set(valid_columns)
 	result = [

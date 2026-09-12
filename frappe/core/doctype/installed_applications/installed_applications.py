@@ -6,6 +6,7 @@ import json
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import cint
 
 
 class InvalidAppOrder(frappe.ValidationError):
@@ -13,6 +14,8 @@ class InvalidAppOrder(frappe.ValidationError):
 
 
 class InstalledApplications(Document):
+	_DOCTYPE_NAME = "Installed Applications"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -26,17 +29,84 @@ class InstalledApplications(Document):
 	# end: auto-generated types
 
 	def update_versions(self):
+		self.reload_doc_if_required()
+
+		app_wise_setup_details = self.get_app_wise_setup_details()
+		disabled_apps = frappe.get_disabled_apps()
+
 		self.delete_key("installed_applications")
 		for app in frappe.utils.get_installed_apps_info():
+			has_setup_wizard = 1
+			setup_complete = app_wise_setup_details.get(app.get("app_name")) or 0
+			if app.get("app_name") in ["frappe", "erpnext"] and not setup_complete:
+				if app.get("app_name") == "frappe" and has_non_admin_user():
+					setup_complete = 1
+
+				if app.get("app_name") == "erpnext" and has_company():
+					setup_complete = 1
+
+			if app.get("app_name") not in ["frappe", "erpnext"]:
+				setup_complete = 0
+				has_setup_wizard = 0
+
 			self.append(
 				"installed_applications",
 				{
 					"app_name": app.get("app_name"),
 					"app_version": app.get("version") or "UNVERSIONED",
 					"git_branch": app.get("branch") or "UNVERSIONED",
+					"has_setup_wizard": has_setup_wizard,
+					"is_setup_complete": setup_complete,
+					"disabled": app.get("app_name") in disabled_apps,
 				},
 			)
-		self.save()
+
+		try:
+			savepoint = "update_installed_apps"
+			frappe.db.savepoint(savepoint)
+			self.save()
+		except frappe.db.DataError:
+			frappe.db.rollback(save_point=savepoint)
+			# Tolerate primary key change on versions during migrate
+			self.save(ignore_version=True)
+
+		frappe.clear_cache(doctype="System Settings")
+		frappe.db.set_single_value("System Settings", "setup_complete", frappe.is_setup_complete())
+
+	def get_app_wise_setup_details(self):
+		"""Get app wise setup details from the Installed Application doctype"""
+		return frappe._dict(
+			frappe.get_all(
+				"Installed Application",
+				fields=["app_name", "is_setup_complete"],
+				filters={"has_setup_wizard": 1},
+				as_list=True,
+			)
+		)
+
+	def reload_doc_if_required(self):
+		if frappe.db.has_column("Installed Application", "disabled"):
+			return
+
+		frappe.reload_doc("core", "doctype", "installed_application")
+		frappe.reload_doc("core", "doctype", "installed_applications")
+		frappe.reload_doc("integrations", "doctype", "webhook")
+
+
+def has_non_admin_user():
+	if frappe.db.has_table("User") and frappe.db.get_value(
+		"User", {"user_type": "System User", "name": ["not in", ["Administrator", "Guest"]]}
+	):
+		return True
+
+	return False
+
+
+def has_company():
+	if frappe.db.has_table("Company") and frappe.get_all("Company", limit=1):
+		return True
+
+	return False
 
 
 @frappe.whitelist()
@@ -49,8 +119,7 @@ def update_installed_apps_order(new_order: list[str] | str):
 	"""
 	frappe.only_for("System Manager")
 
-	if isinstance(new_order, str):
-		new_order = json.loads(new_order)
+	new_order = frappe.parse_json(new_order)
 
 	frappe.local.request_cache and frappe.local.request_cache.clear()
 	existing_order = frappe.get_installed_apps(_ensure_on_bench=True)
@@ -81,7 +150,63 @@ def _create_version_log_for_change(old, new):
 
 
 @frappe.whitelist()
+def set_app_state(app_name: str, disabled: bool | int | str):
+	"""Disable or enable an installed app on this site without touching its data."""
+	frappe.only_for("System Manager")
+
+	from frappe.installer import disable_app, enable_app
+
+	if cint(disabled):
+		disable_app(app_name)
+	else:
+		enable_app(app_name)
+
+
+@frappe.whitelist()
 def get_installed_app_order() -> list[str]:
 	frappe.only_for("System Manager")
 
 	return frappe.get_installed_apps(_ensure_on_bench=True)
+
+
+def get_setup_wizard_completed_apps():
+	"""Get list of apps that have completed setup wizard"""
+	apps: InstalledApplications = frappe.client_cache.get_doc("Installed Applications")
+	return [a.app_name for a in apps.installed_applications if a.has_setup_wizard and a.is_setup_complete]
+
+
+def get_setup_wizard_not_required_apps():
+	"""Get list of apps that do not require setup wizard"""
+	apps: InstalledApplications = frappe.client_cache.get_doc("Installed Applications")
+	return [a.app_name for a in apps.installed_applications if not a.has_setup_wizard]
+
+
+@frappe.request_cache
+def get_apps_with_incomplete_dependencies(current_app):
+	"""Get apps with incomplete dependencies."""
+	dependent_apps = ["frappe"]
+
+	if apps := frappe.get_hooks("required_apps", app_name=current_app):
+		dependent_apps.extend(apps)
+
+	parsed_apps = []
+	for apps in dependent_apps:
+		apps = apps.split("/")
+		parsed_apps.extend(apps)
+
+	pending_apps = get_setup_wizard_pending_apps(parsed_apps)
+
+	return pending_apps
+
+
+def get_setup_wizard_pending_apps(apps=None):
+	"""Get list of apps that have completed setup wizard"""
+
+	apps: InstalledApplications = frappe.client_cache.get_doc("Installed Applications")
+	pending_apps = [
+		a.app_name for a in apps.installed_applications if a.has_setup_wizard and not a.is_setup_complete
+	]
+	if apps:
+		pending_apps = [a for a in pending_apps if a in apps]
+
+	return pending_apps

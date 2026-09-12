@@ -8,10 +8,10 @@ import frappe
 from frappe.database.utils import NestedSetHierarchy
 from frappe.model.db_query import get_timespan_date_range
 from frappe.query_builder import Field
-from frappe.query_builder.functions import Coalesce
+from frappe.utils import cstr
 
 
-def like(key: Field, value: str) -> frappe.qb:
+def like(key: Field, value: str):
 	"""Wrapper method for `LIKE`
 
 	Args:
@@ -24,7 +24,18 @@ def like(key: Field, value: str) -> frappe.qb:
 	return key.like(value)
 
 
-def func_in(key: Field, value: list | tuple) -> frappe.qb:
+def ilike(key: Field, value: str):
+	"""Wrapper method for `ILIKE`
+	Args:
+	        key (str): field
+	        value (str): criterion
+	Return:
+	        frappe.qb: `frappe.qb` object with `ILIKE`
+	"""
+	return key.ilike(value)
+
+
+def func_in(key: Field, value: list | tuple):
 	"""Wrapper method for `IN`.
 
 	Args:
@@ -36,10 +47,14 @@ def func_in(key: Field, value: list | tuple) -> frappe.qb:
 	"""
 	if isinstance(value, str):
 		value = value.split(",")
+
+	value = ["" if v is None else v for v in value]
+	if "" in value:
+		return key.isin(value) | key.isnull()
 	return key.isin(value)
 
 
-def not_like(key: Field, value: str) -> frappe.qb:
+def not_like(key: Field, value: str):
 	"""Wrapper method for `NOT LIKE`.
 
 	Args:
@@ -67,7 +82,7 @@ def func_not_in(key: Field, value: list | tuple | str):
 	return key.notin(value)
 
 
-def func_regex(key: Field, value: str) -> frappe.qb:
+def func_regex(key: Field, value: str):
 	"""Wrapper method for `REGEX`
 
 	Args:
@@ -80,7 +95,7 @@ def func_regex(key: Field, value: str) -> frappe.qb:
 	return key.regex(value)
 
 
-def func_between(key: Field, value: list | tuple) -> frappe.qb:
+def func_between(key: Field, value: list | tuple):
 	"""Wrapper method for `BETWEEN`.
 
 	Args:
@@ -90,15 +105,23 @@ def func_between(key: Field, value: list | tuple) -> frappe.qb:
 	Return:
 	        frappe.qb: `frappe.qb` object with `BETWEEN`
 	"""
+	assert isinstance(value, list | tuple) and len(value) == 2, "between requires exactly two bounds"
 	return key[slice(*value)]
 
 
 def func_is(key, value):
 	"Wrapper for IS"
-	return Coalesce(key, "") != "" if value.lower() == "set" else Coalesce(key, "") == ""
+
+	match cstr(value).lower():
+		case "set":
+			return key != ""
+		case "not set":
+			return key.isnull() | (key == "")
+		case _:
+			raise ValueError("`is` operator only supports `set` and `not set` as value")
 
 
-def func_timespan(key: Field, value: str) -> frappe.qb:
+def func_timespan(key: Field, value: str):
 	"""Wrapper method for `TIMESPAN`.
 
 	Args:
@@ -129,6 +152,7 @@ OPERATOR_MAP: dict[str, Callable] = {
 	"in": func_in,
 	"not in": func_not_in,
 	"like": like,
+	"ilike": ilike,
 	"not like": not_like,
 	"regex": func_regex,
 	"between": func_between,
@@ -136,5 +160,7 @@ OPERATOR_MAP: dict[str, Callable] = {
 	"timespan": func_timespan,
 	# TODO: Add support for custom operators (WIP) - via filters_config hooks
 }
+
+assert all(callable(fn) for fn in OPERATOR_MAP.values()), "every OPERATOR_MAP entry must be callable"
 
 NESTED_SET_OPERATORS = frozenset(NestedSetHierarchy)

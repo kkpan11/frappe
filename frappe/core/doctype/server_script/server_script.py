@@ -9,6 +9,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.rate_limiter import rate_limit
+from frappe.utils.caching import http_cache
 from frappe.utils.safe_exec import (
 	FrappeTransformer,
 	get_keys_for_autocomplete,
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
 
 
 class ServerScript(Document):
+	_DOCTYPE_NAME = "Server Script"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -75,11 +78,14 @@ class ServerScript(Document):
 			"Cron",
 		]
 		module: DF.Link | None
+		queue: DF.Literal["", "default", "short", "long"]
 		rate_limit_count: DF.Int
 		rate_limit_seconds: DF.Int
 		reference_doctype: DF.Link | None
 		script: DF.Code
-		script_type: DF.Literal["DocType Event", "Scheduler Event", "Permission Query", "API"]
+		script_type: DF.Literal[
+			"DocType Event", "Scheduler Event", "Permission Query", "API", "Workflow Task"
+		]
 	# end: auto-generated types
 
 	def validate(self):
@@ -120,7 +126,14 @@ class ServerScript(Document):
 			if scheduled_script := frappe.db.get_value("Scheduled Job Type", {"server_script": self.name}):
 				return frappe.get_doc("Scheduled Job Type", scheduled_script)
 			else:
-				return frappe.get_doc({"doctype": "Scheduled Job Type", "server_script": self.name})
+				should_create_log = self.event_frequency not in ("All", "Cron")
+				return frappe.get_doc(
+					{
+						"doctype": "Scheduled Job Type",
+						"server_script": self.name,
+						"create_log": should_create_log,
+					}
+				)
 
 		previous_script_type = self.get_value_before_save("script_type")
 		if previous_script_type != self.script_type and previous_script_type == "Scheduler Event":
@@ -130,6 +143,7 @@ class ServerScript(Document):
 		if self.script_type != "Scheduler Event" or not (
 			self.has_value_changed("event_frequency")
 			or self.has_value_changed("cron_format")
+			or self.has_value_changed("queue")
 			or self.has_value_changed("disabled")
 			or self.has_value_changed("script_type")
 		):
@@ -140,6 +154,7 @@ class ServerScript(Document):
 				"method": frappe.scrub(f"{self.name}-{self.event_frequency}"),
 				"frequency": self.event_frequency,
 				"cron_format": self.cron_format if self.event_frequency == "Cron" else "",
+				"queue": self.queue,
 				"stopped": self.disabled,
 			}
 		).save()
@@ -168,12 +183,11 @@ class ServerScript(Document):
 
 		if self.enable_rate_limit:
 			# Wrap in rate limiter, required for specifying custom limits for each script
-			# Note that rate limiter works on `cmd` which is script name
 			limit = self.rate_limit_count or 5
 			seconds = self.rate_limit_seconds or 24 * 60 * 60
 
 			_fn = partial(execute_api_server_script, script=self)
-			return rate_limit(limit=limit, seconds=seconds)(_fn)()
+			return rate_limit(limit=limit, seconds=seconds, endpoint=f"server_script:{self.name}")(_fn)()
 		else:
 			return execute_api_server_script(self)
 
@@ -201,22 +215,41 @@ class ServerScript(Document):
 
 		safe_exec(self.script, script_filename=self.name)
 
-	def get_permission_query_conditions(self, user: str) -> list[str]:
+	def get_permission_query_conditions(self, user: str, active_child_tables=None) -> list[str]:
 		"""Specific to Permission Query Server Scripts.
 
 		Args:
 		        user (str): Take user email to execute script and return list of conditions.
+				active_child_tables (list, optional): A list of child table names involved in the current SQL query.
 
 		Return:
 		        list: Return list of conditions defined by rules in self.script.
 		"""
-		locals = {"user": user, "conditions": ""}
+		locals = {
+			"user": user,
+			"conditions": "",
+			"active_child_tables": active_child_tables or [],
+		}
 		safe_exec(self.script, None, locals, script_filename=self.name)
 		if locals["conditions"]:
 			return locals["conditions"]
 
+	def execute_workflow_task(self, doc: Document):
+		"""
+		Specific to Workflow Tasks via Workflow Action Master
+		"""
+		if self.script_type != "Workflow Task":
+			raise frappe.DoesNotExistError
+
+		safe_exec(
+			self.script,
+			_locals={"doc": doc},
+			script_filename=self.name,
+		)
+
 
 @frappe.whitelist()
+@http_cache(max_age=10 * 60, stale_while_revalidate=6 * 60 * 60)
 def get_autocompletion_items():
 	"""Generate a list of autocompletion strings from the context dict
 	that is used while executing a Server Script.

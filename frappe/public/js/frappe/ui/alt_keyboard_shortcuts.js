@@ -95,6 +95,20 @@ function get_shortcut_for_key(key) {
 frappe.ui.keys.AltShortcutGroup = class AltShortcutGroup {
 	constructor() {
 		this.shortcuts_dict = {};
+		this.blacklisted_letters = [];
+
+		let language;
+		try {
+			language = new Intl.Locale(navigator.language).language;
+		} catch {
+			language = null;
+		}
+
+		// Skip certain Keys for different Languages on different Platforms
+		if (language === "de") {
+			this.blacklisted_letters = frappe.utils.is_mac() ? ["e", "l"] : ["q"];
+		}
+
 		$current_dropdown = null;
 		this.bind_events();
 		frappe.ui.keys.bind_shortcut_group_event();
@@ -179,6 +193,10 @@ frappe.ui.keys.AltShortcutGroup = class AltShortcutGroup {
 		let is_in_global_shortcut = frappe.ui.keys.standard_shortcuts
 			.filter((s) => !s.page)
 			.some((s) => s.shortcut === `alt+${letter}`);
-		return letter in this.shortcuts_dict || is_in_global_shortcut;
+		return (
+			letter in this.shortcuts_dict ||
+			is_in_global_shortcut ||
+			this.blacklisted_letters.includes(letter.toLowerCase())
+		);
 	}
 };

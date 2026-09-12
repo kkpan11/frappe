@@ -1,10 +1,19 @@
 <script setup>
-import { ref, computed, nextTick } from "vue";
+import { ref, computed, nextTick, watch } from "vue";
 import { useStore } from "../store";
 
 let store = useStore();
 
 let title = ref("Workflow Details");
+
+watch(
+	() => store.workflow_doc?.document_type,
+	async (newDocType) => {
+		if (!newDocType) return;
+		await store.update_is_submittable();
+		store.reset_non_submittable_states();
+	}
+);
 
 let doc = computed(() => {
 	return store.workflow.selected ? store.workflow.selected.data : store.workflow_doc;
@@ -18,7 +27,9 @@ let properties = computed(() => {
 	if (store.workflow.selected && "action" in store.workflow.selected.data) {
 		title.value = __("Transition Properties");
 		return store.transitionfields.filter((df) =>
-			["action", "allowed", "allow_self_approval", "condition"].includes(df.fieldname)
+			["action", "allowed", "allow_self_approval", "condition", "transition_tasks"].includes(
+				df.fieldname
+			)
 		);
 	} else if (store.workflow.selected && "state" in store.workflow.selected.data) {
 		title.value = __("State Properties");
@@ -59,6 +70,7 @@ let properties = computed(() => {
 						v-model="doc[df.fieldname]"
 						:data-fieldname="df.fieldname"
 						:data-fieldtype="df.fieldtype"
+						:read_only="df.fieldname === 'doc_status' ? !store.is_submittable : false"
 					/>
 				</div>
 			</div>

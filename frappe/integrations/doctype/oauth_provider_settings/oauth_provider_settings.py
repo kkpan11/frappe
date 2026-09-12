@@ -7,6 +7,8 @@ from frappe.model.document import Document
 
 
 class OAuthProviderSettings(Document):
+	_DOCTYPE_NAME = "OAuth Provider Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -19,10 +21,3 @@ class OAuthProviderSettings(Document):
 	# end: auto-generated types
 
 	pass
-
-
-def get_oauth_settings():
-	"""Return OAuth settings."""
-	return frappe._dict(
-		{"skip_authorization": frappe.db.get_single_value("OAuth Provider Settings", "skip_authorization")}
-	)

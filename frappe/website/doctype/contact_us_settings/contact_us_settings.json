@@ -1,12 +1,14 @@
 {
  "actions": [],
+ "allow_bulk_edit": 1,
  "creation": "2013-02-21 20:12:42",
  "description": "Settings for Contact Us Page",
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
-  "disable_contact_us",
   "introduction_section",
+  "is_disabled",
+  "send_acknowledgement_email",
   "forward_to_email",
   "heading",
   "introduction",
@@ -56,7 +58,6 @@
    "label": "Query Options"
   },
   {
-   "collapsible": 1,
    "fieldname": "address",
    "fieldtype": "Section Break",
    "label": "Address"
@@ -85,7 +86,7 @@
   {
    "fieldname": "state",
    "fieldtype": "Data",
-   "label": "State"
+   "label": "State/Province"
   },
   {
    "fieldname": "pincode",
@@ -119,17 +120,24 @@
    "label": "Skype"
   },
   {
-   "default": "0",
-   "fieldname": "disable_contact_us",
+   "default": "1",
+   "fieldname": "is_disabled",
    "fieldtype": "Check",
-   "label": "Disable Contact Us Page"
+   "label": "Disabled"
+  },
+  {
+   "default": "1",
+   "description": "Send an acknowledgement email to the email address entered in the contact form.",
+   "fieldname": "send_acknowledgement_email",
+   "fieldtype": "Check",
+   "label": "Send Acknowledgement Email"
   }
  ],
  "icon": "fa fa-cog",
  "idx": 1,
  "issingle": 1,
  "links": [],
- "modified": "2024-03-23 16:01:31.401053",
+ "modified": "2026-08-03 15:41:06.808383",
  "modified_by": "Administrator",
  "module": "Website",
  "name": "Contact Us Settings",
@@ -145,6 +153,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "creation",
  "sort_order": "DESC",
  "states": [],

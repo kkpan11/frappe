@@ -41,9 +41,10 @@ def make_new_doc(doctype):
 	doc["doctype"] = doctype
 	doc["__islocal"] = 1
 
-	if not frappe.model.meta.is_single(doctype):
+	if not getattr(doc.meta, "issingle", False):
 		doc["__unsaved"] = 1
 
+	assert doc["doctype"] == doctype, "new doc template must carry the requested doctype"
 	return doc
 
 
@@ -65,7 +66,7 @@ def set_user_and_static_default_values(doc):
 			)
 			if user_default_value is not None:
 				# if fieldtype is link check if doc exists
-				if df.fieldtype != "Link" or frappe.db.exists(df.options, user_default_value):
+				if df.fieldtype != "Link" or frappe.db.exists(df.options, user_default_value, cache=True):
 					doc.set(df.fieldname, user_default_value)
 
 			else:
@@ -146,8 +147,8 @@ def set_dynamic_default_values(doc, parent_doc, parentfield):
 			elif df.fieldtype == "Datetime" and df.default.lower() == "now":
 				doc[df.fieldname] = now_datetime()
 
-		if df.fieldtype == "Time":
-			doc[df.fieldname] = nowtime()
+			elif df.fieldtype == "Time" and df.default.lower() == "now":
+				doc[df.fieldname] = nowtime()
 
 	if parent_doc:
 		doc["parent"] = parent_doc.name

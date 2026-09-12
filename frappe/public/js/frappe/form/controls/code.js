@@ -29,9 +29,10 @@ frappe.ui.form.ControlCode = class ControlCode extends frappe.ui.form.ControlTex
 				style="position: absolute; top: 32px; right: 5px;"
 				onmouseover="this.classList.add('btn-default')"
 				onmouseout="this.classList.remove('btn-default')"
+				title="${__("Copy to Clipboard")}"
 			>
-				<svg class="es-icon es-line  icon-sm" style="" aria-hidden="true">
-					<use class="" href="#es-line-copy-light"></use>
+				<svg class="icon icon-sm" style="" aria-hidden="true">
+					<use class="" href="#icon-copy"></use>
 				</svg>
 			</button>`
 		);
@@ -81,6 +82,7 @@ frappe.ui.form.ControlCode = class ControlCode extends frappe.ui.form.ControlTex
 		}
 
 		this.editor.setTheme("ace/theme/tomorrow");
+		this.editor.setOption("placeholder", this.df.placeholder);
 		this.editor.setOption("showPrintMargin", false);
 		this.editor.setOption("wrap", this.df.wrap);
 		this.set_language();
@@ -111,15 +113,21 @@ frappe.ui.form.ControlCode = class ControlCode extends frappe.ui.form.ControlTex
 				if (!this._autocompletions) {
 					this._autocompletions = [];
 				}
-				this._autocompletions.push(getter);
-				this.setup_autocompletion();
+
+				if (value.length > 0) {
+					this._autocompletions.push(getter);
+					this.setup_autocompletion();
+				} else {
+					this.editor.setOptions({
+						enableBasicAutocompletion: false,
+						enableLiveAutocompletion: false,
+					});
+				}
 			},
 		});
 	}
 
 	setup_autocompletion(customGetCompletions) {
-		if (this._autocompletion_setup) return;
-
 		const ace = window.ace;
 
 		let getCompletions = (editor, session, pos, prefix, callback) => {
@@ -166,12 +174,15 @@ frappe.ui.form.ControlCode = class ControlCode extends frappe.ui.form.ControlTex
 				getCompletions: customGetCompletions || getCompletions,
 			});
 		});
-		this._autocompletion_setup = true;
 	}
 
 	refresh_height() {
 		this.ace_editor_target.css("height", this.expanded ? 600 : 300);
 		this.editor.resize();
+	}
+
+	on_section_collapse(hide) {
+		!hide && this.editor?.resize();
 	}
 
 	toggle_label() {
@@ -239,6 +250,10 @@ frappe.ui.form.ControlCode = class ControlCode extends frappe.ui.form.ControlTex
 
 	get_input_value() {
 		return this.editor ? this.editor.session.getValue() : "";
+	}
+
+	set_focus() {
+		this.editor?.focus();
 	}
 
 	load_lib() {

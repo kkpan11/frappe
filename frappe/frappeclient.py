@@ -64,8 +64,8 @@ class FrappeClient:
 	def _login(self, username, password):
 		"""Login/start a session. Called internally on init"""
 		r = self.session.post(
-			self.url,
-			params={"cmd": "login", "usr": username, "pwd": password},
+			self.url + "/api/method/login",
+			data={"usr": username, "pwd": password},
 			verify=self.verify,
 			headers=self.headers,
 		)
@@ -107,12 +107,23 @@ class FrappeClient:
 			headers=self.headers,
 		)
 
-	def get_list(self, doctype, fields='["name"]', filters=None, limit_start=0, limit_page_length=None):
+	def get_list(
+		self,
+		doctype: str,
+		fields='["name"]',
+		filters=None,
+		limit_start: int = 0,
+		limit_page_length: int | None = None,
+		order_by=None,
+		group_by=None,
+	):
 		"""Return list of records of a particular type."""
 		if not isinstance(fields, str):
 			fields = json.dumps(fields)
 		params = {
 			"fields": fields,
+			"order_by": order_by,
+			"group_by": group_by,
 		}
 		if filters:
 			params["filters"] = json.dumps(filters)
@@ -332,12 +343,16 @@ class FrappeClient:
 		)
 		return self.post_process(res)
 
-	def post_api(self, method, params=None):
-		if params is None:
-			params = {}
-		res = self.session.post(
-			f"{self.url}/api/method/{method}", params=params, verify=self.verify, headers=self.headers
-		)
+	def post_api(self, method, params=None, json=None):
+		url = f"{self.url}/api/method/{method}"
+
+		if json is not None:
+			headers = {**self.headers, "content-type": "application/json"}
+			res = self.session.post(url, json=json, verify=self.verify, headers=headers)
+		else:
+			res = self.session.post(
+				url, data=self.preprocess(params or {}), verify=self.verify, headers=self.headers
+			)
 		return self.post_process(res)
 
 	def get_request(self, params):

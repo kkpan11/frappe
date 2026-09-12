@@ -1,5 +1,4 @@
 import csv
-import gettext
 import multiprocessing
 import os
 from collections import defaultdict
@@ -10,12 +9,14 @@ from babel.messages.catalog import Catalog
 from babel.messages.extract import DEFAULT_KEYWORDS, extract_from_dir
 from babel.messages.mofile import read_mo, write_mo
 from babel.messages.pofile import read_po, write_po
+from click import secho
 
 import frappe
 from frappe.utils import get_bench_path
 
 PO_DIR = "locale"  # po and pot files go into [app]/locale
 POT_FILE = "main.pot"  # the app's pot file is always main.pot
+PYTHON_KEYWORDS = DEFAULT_KEYWORDS | {"_lt": None, "N_": None}
 
 
 def new_catalog(app: str, locale: str | None = None) -> Catalog:
@@ -130,12 +131,10 @@ def generate_pot(target_app: str | None = None):
 	apps = [target_app] if target_app else frappe.get_all_apps(True)
 	default_method_map = get_method_map("frappe")
 
-	keywords = DEFAULT_KEYWORDS.copy()
-	keywords["_lt"] = None
-
 	for app in apps:
 		app_path = frappe.get_pymodule_path(app, "..")
 		catalog = new_catalog(app)
+		ignored_strings = _get_ignored_strings(app)
 
 		# Each file will only be processed by the first method that matches,
 		# so more specific methods should come first.
@@ -143,15 +142,66 @@ def generate_pot(target_app: str | None = None):
 		method_map.extend(default_method_map)
 
 		for filename, lineno, message, comments, context in extract_from_dir(
-			app_path, method_map, directory_filter=directory_filter, keywords=keywords
+			app_path, method_map, directory_filter=directory_filter, keywords=PYTHON_KEYWORDS
 		):
 			if not message:
+				continue
+
+			if (message, context) in ignored_strings:
 				continue
 
 			catalog.add(message, locations=[(filename, lineno)], auto_comments=comments, context=context)
 
 		pot_path = write_catalog(app, catalog)
 		print(f"POT file created at {pot_path}")
+
+
+def _get_ignored_strings(app: str) -> set[tuple[str, str | None]]:
+	"""Return a set of tuples (message, context) that should be excluded from the given app's POT file.
+
+	Example:
+	    If [app]/hooks.py contains:
+	        ignore_translatable_strings_from = ["frappe"]
+
+	    Then this will return a set of tuples (message, context) with all
+	    entries from frappe's POT file.
+	"""
+	ignored_strings = set()
+	for ignore_app in frappe.get_hooks("ignore_translatable_strings_from", [], app_name=app):
+		if ignore_app == app:
+			raise ValueError(
+				f"Invalid configuration: App '{app}' cannot ignore its own translatable strings. "
+				f"Remove '{app}' from the 'ignore_translatable_strings_from' hook in {app}/hooks.py to fix this."
+			)
+
+		try:
+			catalog = get_catalog(ignore_app)
+		except ModuleNotFoundError:
+			secho(
+				f"App '{ignore_app}' specified in '{app}/hooks.py' 'ignore_translatable_strings_from' hook is not installed. Skipping",
+				err=True,
+				fg="yellow",
+			)
+			continue
+		except ImportError:
+			secho(
+				f"App '{ignore_app}' specified in '{app}/hooks.py' 'ignore_translatable_strings_from' hook could not be imported. Skipping",
+				err=True,
+				fg="yellow",
+			)
+			continue
+		except AttributeError:
+			secho(
+				f"Site not initialized. Cannot load app '{ignore_app}' specified in '{app}/hooks.py' 'ignore_translatable_strings_from' hook. Skipping",
+				err=True,
+				fg="yellow",
+			)
+			continue
+
+		for message in catalog:
+			ignored_strings.add((message.id, message.context))
+
+	return ignored_strings
 
 
 def get_is_gitignored_function_for_app(app: str | None):
@@ -194,13 +244,13 @@ def new_po(locale, target_app: str | None = None):
 		)
 
 
-def compile_translations(target_app: str | None = None, locale: str | None = None, force=False):
+def compile_translations(target_app: str | None = None, locale: str | None = None, force=False, verbose=True):
 	apps = [target_app] if target_app else frappe.get_all_apps(True)
 	tasks = []
 	for app in apps:
 		locales = [locale] if locale else get_locales(app)
 		for current_locale in locales:
-			tasks.append((app, current_locale, force))
+			tasks.append((app, current_locale, force, verbose))
 
 	# Execute all tasks, doing this sequentially is quite slow hence use processpool of 4
 	# processes.
@@ -211,21 +261,23 @@ def compile_translations(target_app: str | None = None, locale: str | None = Non
 	executer.join()
 
 
-def _compile_translation(app, locale, force=False):
+def _compile_translation(app, locale, force=False, verbose=True):
 	po_path = get_po_path(app, locale)
 	mo_path = get_mo_path(app, locale)
 	if not po_path.exists():
 		return
 
 	if mo_path.exists() and po_path.stat().st_mtime < mo_path.stat().st_mtime and not force:
-		print(f"MO file already up to date at {mo_path}")
+		if verbose:
+			print(f"MO file already up to date at {mo_path}")
 		return
 
 	with open(po_path, "rb") as f:
 		catalog = read_po(f)
 
 	mo_path = write_binary(app, catalog, locale)
-	print(f"MO file created at {mo_path}")
+	if verbose:
+		print(f"MO file created at {mo_path}")
 
 
 def update_po(target_app: str | None = None, locale: str | None = None):
@@ -293,10 +345,10 @@ def csv_to_po(app: str, locale: str):
 
 
 def get_translations_from_mo(lang, app):
-	"""Get translations from MO files.
+	"""Get translations from the MO file of exactly this locale.
 
-	For dialects (i.e. es_GT), take translations from the base language (i.e. es)
-	and then update with specific translations from the dialect (i.e. es_GT).
+	Dialects (i.e. es_GT) are not resolved here; callers merge the base language
+	(i.e. es) separately so that a dialect catalogue stays an overlay on top of it.
 
 	If we only have a translation with context, also use it as a translation
 	without context. This way we can provide the context for each source string
@@ -308,9 +360,8 @@ def get_translations_from_mo(lang, app):
 	translations = {}
 	lang = lang.replace("-", "_")  # Frappe uses dash, babel uses underscore.
 
-	locale_dir = get_locale_dir()
-	mo_file = gettext.find(app, locale_dir, (lang,))
-	if not mo_file:
+	mo_file = get_mo_path(app, lang)
+	if not mo_file.exists():
 		return translations
 	with open(mo_file, "rb") as f:
 		catalog = read_mo(f)

@@ -10,9 +10,11 @@ from frappe.core.doctype.user.user import generate_keys
 from frappe.frappeclient import FrappeClient, FrappeException
 from frappe.model import default_fields
 from frappe.tests import IntegrationTestCase
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils.data import get_url
 
 
+@requires_test_service(TestService.WEB_SERVER)
 class TestFrappeClient(IntegrationTestCase):
 	PASSWORD = frappe.conf.admin_password or "admin"
 
@@ -51,6 +53,36 @@ class TestFrappeClient(IntegrationTestCase):
 		doc_list = server.get_list("Note")
 
 		self.assertTrue(len(doc_list))
+
+	def test_list_summary(self):
+		server = FrappeClient(get_url(), "Administrator", self.PASSWORD, verify=False)
+		server.insert_many(
+			[
+				{"doctype": "Note", "title": "Sing"},
+				{"doctype": "Note", "title": "a"},
+				{"doctype": "Note", "title": "song"},
+				{"doctype": "Note", "title": "of"},
+				{"doctype": "Note", "title": "sixpence"},
+			]
+		)
+		notes = server.get_list("Note", fields=["title"], order_by="creation desc")
+
+		notes = [d.get("title") for d in notes]
+		self.assertEqual(notes[0], "sixpence")
+
+		getlist_users = server.get_list(
+			"User",
+			fields=[{"COUNT": "name", "as": "user_count"}],
+			filters={"user_type": "System User"},
+			group_by="user_type",
+		)
+		getall_users = frappe.db.get_all(
+			"User",
+			fields=[{"COUNT": "name", "as": "system_user_count"}],
+			filters={"user_type": "System User"},
+			group_by="user_type",
+		)
+		self.assertEqual(getlist_users[0]["user_count"], getall_users[0]["system_user_count"])
 
 	def test_get_doc(self):
 		USER = "Administrator"
@@ -105,7 +137,9 @@ class TestFrappeClient(IntegrationTestCase):
 		self.assertEqual(
 			server.get_value("Website Settings", "title_prefix").get("title_prefix"), "test-prefix"
 		)
+		frappe.db.rollback()  # Clear snapshot isolation
 		frappe.db.set_single_value("Website Settings", "title_prefix", "")
+		frappe.db.commit()
 
 	def test_update_doc(self):
 		server = FrappeClient(get_url(), "Administrator", self.PASSWORD, verify=False)

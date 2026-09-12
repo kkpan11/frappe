@@ -7,19 +7,11 @@ from contextlib import contextmanager
 import frappe
 from frappe.desk.query_report import generate_report_result, get_report_doc
 from frappe.query_builder.utils import db_type_is
-from frappe.tests import IntegrationTestCase, UnitTestCase, timeout
-from frappe.tests.test_query_builder import run_only_if
+from frappe.tests import IntegrationTestCase, timeout
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 
 
-class UnitTestPreparedReport(UnitTestCase):
-	"""
-	Unit tests for PreparedReport.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
-
-
+@requires_test_service(TestService.BACKGROUND_WORKER)
 class TestPreparedReport(IntegrationTestCase):
 	@classmethod
 	def tearDownClass(cls):
@@ -72,9 +64,12 @@ class TestPreparedReport(IntegrationTestCase):
 		self.assertEqual(len(prepared_data["result"]), len(generated_data["result"]))
 		self.assertEqual(len(prepared_data), len(generated_data))
 
-	@run_only_if(db_type_is.MARIADB)
 	def test_start_status_and_kill_jobs(self):
-		with test_report(report_type="Query Report", query="select sleep(10)") as report:
+		if frappe.db.db_type == "postgres":
+			query = "select pg_sleep(5)"
+		elif frappe.db.db_type == "mariadb":
+			query = "select sleep(5)"
+		with test_report(report_type="Query Report", query=query) as report:
 			doc = self.create_prepared_report(report.name)
 			self.wait_for_status(doc, "Started")
 			job_id = doc.job_id

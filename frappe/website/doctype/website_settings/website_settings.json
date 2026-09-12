@@ -6,6 +6,7 @@
    "label": "Clear Cache"
   }
  ],
+ "allow_bulk_edit": 1,
  "creation": "2013-04-30 12:58:46",
  "doctype": "DocType",
  "document_type": "Other",
@@ -19,6 +20,7 @@
   "misc_section",
   "app_name",
   "disable_signup",
+  "max_signups_per_minute",
   "show_footer_on_login",
   "column_break_9",
   "app_logo",
@@ -273,6 +275,7 @@
    "label": "Robots.txt"
   },
   {
+   "allow_bulk_edit": 1,
    "fieldname": "route_redirects",
    "fieldtype": "Table",
    "label": "Route Redirects",
@@ -280,7 +283,7 @@
   },
   {
    "default": "0",
-   "description": "To use Google Indexing, enable <a href=\"/app/google-settings\">Google Settings</a>.",
+   "description": "To use Google Indexing, enable <a href=\"/desk/google-settings\" rel=\"noopener noreferrer\">Google Settings</a>.",
    "fieldname": "enable_google_indexing",
    "fieldtype": "Check",
    "label": "Enable Google indexing"
@@ -476,6 +479,13 @@
    "fieldname": "show_footer_on_login",
    "fieldtype": "Check",
    "label": "Show footer on login"
+  },
+  {
+   "default": "500",
+   "depends_on": "eval: !doc.disable_signup",
+   "fieldname": "max_signups_per_minute",
+   "fieldtype": "Int",
+   "label": "Max signups per minute"
   }
  ],
  "icon": "fa fa-cog",
@@ -483,7 +493,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2024-03-23 16:04:03.999928",
+ "modified": "2026-08-03 19:38:17.441996",
  "modified_by": "Administrator",
  "module": "Website",
  "name": "Website Settings",
@@ -504,6 +514,7 @@
    "role": "All"
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "creation",
  "sort_order": "DESC",
  "states": [],

@@ -1,10 +1,16 @@
 import json
 import re
 
+import nh3
 from bleach_allowlist import bleach_allowlist
 
 import frappe
 from frappe.utils.data import escape_html
+
+# Matches the first opening tag. Deliberately equivalent to
+# `bool(BeautifulSoup(html, "html.parser").find())`, which treats comments, `<3`
+# and unmatched end tags as text rather than tags — see `test_html_utils.py`.
+HTML_TAG_PATTERN = re.compile(r"<[a-zA-Z][^>]*>")
 
 EMOJI_PATTERN = re.compile(
 	"(\ud83d[\ude00-\ude4f])|"
@@ -16,15 +22,16 @@ EMOJI_PATTERN = re.compile(
 	flags=re.UNICODE,
 )
 
+# tags for which content needs to be removed from output
+REMOVE_CONTENT_TAGS = {"script", "style"}
+
 
 def clean_html(html):
-	import bleach
-
 	if not isinstance(html, str):
 		return html
 
-	return bleach.clean(
-		clean_script_and_style(html),
+	return nh3.clean(
+		html,
 		tags={
 			"div",
 			"p",
@@ -42,58 +49,53 @@ def clean_html(html):
 			"tbody",
 			"td",
 			"tr",
+			"a",
 		},
-		attributes=[],
-		strip=True,
+		clean_content_tags=REMOVE_CONTENT_TAGS,
 		strip_comments=True,
 	)
 
 
 def clean_email_html(html):
-	import bleach
-	from bleach.css_sanitizer import CSSSanitizer
-
 	if not isinstance(html, str):
 		return html
 
-	css_sanitizer = CSSSanitizer(
-		allowed_css_properties=[
-			"color",
-			"border-color",
-			"width",
-			"height",
-			"max-width",
-			"background-color",
-			"border-collapse",
-			"border-radius",
-			"border",
-			"border-top",
-			"border-bottom",
-			"border-left",
-			"border-right",
-			"margin",
-			"margin-top",
-			"margin-bottom",
-			"margin-left",
-			"margin-right",
-			"padding",
-			"padding-top",
-			"padding-bottom",
-			"padding-left",
-			"padding-right",
-			"font-size",
-			"font-weight",
-			"font-family",
-			"text-decoration",
-			"line-height",
-			"text-align",
-			"vertical-align",
-			"display",
-		]
-	)
+	allowed_css_properties = {
+		"color",
+		"border-color",
+		"width",
+		"height",
+		"max-width",
+		"background-color",
+		"border-collapse",
+		"border-radius",
+		"border",
+		"border-top",
+		"border-bottom",
+		"border-left",
+		"border-right",
+		"margin",
+		"margin-top",
+		"margin-bottom",
+		"margin-left",
+		"margin-right",
+		"padding",
+		"padding-top",
+		"padding-bottom",
+		"padding-left",
+		"padding-right",
+		"font-size",
+		"font-weight",
+		"font-family",
+		"text-decoration",
+		"line-height",
+		"text-align",
+		"vertical-align",
+		"display",
+	}
 
-	return bleach.clean(
-		clean_script_and_style(html),
+	return nh3.clean(
+		html,
 		tags={
 			"div",
 			"p",
@@ -124,16 +126,25 @@ def clean_email_html(html):
 			"button",
 			"img",
 		},
-		attributes=["border", "colspan", "rowspan", "src", "href", "style", "id"],
-		css_sanitizer=css_sanitizer,
-		protocols=["cid", "http", "https", "mailto", "data"],
-		strip=True,
+		attributes={"*": {"border", "colspan", "rowspan", "src", "href", "style", "id"}},
+		clean_content_tags=REMOVE_CONTENT_TAGS,
+		filter_style_properties=allowed_css_properties,
 		strip_comments=True,
+		url_schemes=nh3.ALLOWED_URL_SCHEMES.union({"cid", "data"}),
 	)
 
 
+def has_html_tags(html: str) -> bool:
+	"""Return True if `html` contains at least one HTML tag."""
+	return bool(HTML_TAG_PATTERN.search(html))
+
+
 def clean_script_and_style(html):
-	# remove script and style
+	"""
+	Remove script and style tags.
+	DEPRECATED: prefer nh3.clean's clean_content_tags parameter.
+	"""
+
 	from bs4 import BeautifulSoup
 
 	soup = BeautifulSoup(html, "html5lib")
@@ -142,53 +153,146 @@ def clean_script_and_style(html):
 	return frappe.as_unicode(soup)
 
 
-def sanitize_html(html, linkify=False, always_sanitize=False):
+def sanitize_html(html, linkify=False, always_sanitize=False, disallowed_tags=None):
 	"""
 	Sanitize HTML tags, attributes and style to prevent XSS attacks
-	Based on bleach clean, bleach whitelist and html5lib's Sanitizer defaults
+	Based on nh3 clean, bleach whitelist and html5lib's Sanitizer defaults
 
-	Does not sanitize JSON unless explicitly specified, as it could lead to future problems
+	Content without any HTML tags is returned unchanged; everything else is sanitized.
 	"""
-	import bleach
-	from bleach.css_sanitizer import CSSSanitizer
-	from bs4 import BeautifulSoup
-
 	if not isinstance(html, str):
 		return html
 
 	if not always_sanitize:
-		if is_json(html):
-			return html
-
-		if not bool(BeautifulSoup(html, "html.parser").find()):
+		if not has_html_tags(html):
 			return html
 
 	tags = (
-		acceptable_elements
-		+ svg_elements
-		+ mathml_elements
-		+ ["html", "head", "meta", "link", "body", "style", "o:p"]
+		acceptable_elements.union(svg_elements)
+		.union(mathml_elements)
+		.union(["html", "head", "meta", "link", "body", "o:p"])
 	)
 
-	def attributes_filter(tag, name, value):
-		if name.startswith("data-"):
-			return True
-		return name in acceptable_attributes
+	# Allow caller to explicitly disallow some tags
+	if disallowed_tags:
+		if disallowed_tags == "*":
+			tags = set()
+		else:
+			tags.difference_update(disallowed_tags)
 
-	attributes = {"*": attributes_filter, "svg": svg_attributes}
-	css_sanitizer = CSSSanitizer(allowed_css_properties=bleach_allowlist.all_styles)
+	attributes = {"*": acceptable_attributes, "svg": svg_attributes}
 
-	# returns html with escaped tags, escaped orphan >, <, etc.
-	escaped_html = bleach.clean(
+	# returns sanitized HTML with unsafe tags and attributes removed
+	escaped_html = nh3.clean(
 		html,
 		tags=tags,
 		attributes=attributes,
-		css_sanitizer=css_sanitizer,
+		generic_attribute_prefixes={"data-"},
 		strip_comments=False,
-		protocols={"cid", "http", "https", "mailto"},
+		# bleach's allowlist has column-gap but not gap/row-gap — add them so
+		# flex/grid layouts (already allowed via display/flex) keep their spacing
+		filter_style_properties=set(bleach_allowlist.all_styles) | {"gap", "row-gap"},
+		url_schemes=nh3.ALLOWED_URL_SCHEMES.union({"cid"}),
 	)
 
 	return escaped_html
+
+
+# A request argument is a few levels deep at most: a document holding a child table
+# of rows of fields is four. Past this the walk gives up and the text is sanitized
+# as one blob, the way it was before it learned to look inside. A guest can post
+# arbitrarily nested JSON, and walking it without a bound is a 500.
+MAX_PAYLOAD_DEPTH = 20
+
+
+class PayloadTooDeep(Exception):
+	pass
+
+
+def sanitize_html_payload(text):
+	"""Sanitize HTML in a string that may be carrying a JSON payload.
+
+	`sanitize_html` treats its input as a document that is itself HTML. A request
+	argument is not that: anything richer than a scalar reaches `form_dict` as
+	JSON, so the string is a container whose values may carry HTML.
+
+	Sanitizing the serialized container rewrites the container. The parser reads
+	an embedded tag such as `<div class=\\"x y\\">` (the backslashes are JSON
+	escaping) as `class` holding the unquoted value `\\"x`, drops `y\\"` as a junk
+	attribute, and writes the value back as `class="\\&quot;x"`. That bare quote
+	ends the JSON string early and the payload no longer parses.
+
+	So look inside instead. Decode, sanitize each string in the structure, and
+	re-encode. A payload that needed no cleaning is returned exactly as it
+	arrived, and anything that is not JSON is sanitized as before.
+
+	The walk stops at `MAX_PAYLOAD_DEPTH` and falls back to sanitizing the text
+	as one blob. The content is sanitized either way, and the walk cannot run the
+	interpreter out of stack on a payload built to be deep.
+	"""
+	if not isinstance(text, str):
+		return text
+
+	return _sanitize_payload(text, MAX_PAYLOAD_DEPTH)
+
+
+def _sanitize_payload(text, depth):
+	try:
+		payload = json.loads(text)
+	except (ValueError, RecursionError):
+		return sanitize_html(text)
+
+	try:
+		sanitized = _sanitize_json_strings(payload, depth)
+	except PayloadTooDeep:
+		return sanitize_html(text)
+
+	if sanitized == payload:
+		return text
+
+	return json.dumps(sanitized)
+
+
+def _sanitize_json_strings(value, depth):
+	"""Sanitize every string inside a decoded JSON value, leaving its shape alone.
+
+	Strings go back through `_sanitize_payload`, so a payload nested inside another
+	payload is handled the same way.
+
+	Keys are left as they are. They are looked up as argument and field names,
+	never rendered, and rewriting one could collide with another key and drop a
+	value.
+	"""
+	if depth <= 0:
+		raise PayloadTooDeep
+
+	if isinstance(value, str):
+		return _sanitize_payload(value, depth - 1)
+
+	if isinstance(value, dict):
+		return {key: _sanitize_json_strings(item, depth - 1) for key, item in value.items()}
+
+	if isinstance(value, list):
+		return [_sanitize_json_strings(item, depth - 1) for item in value]
+
+	return value
+
+
+def sanitize_svg(svg: str) -> str:
+	"""Sanitize standalone SVG markup for safe inline rendering (e.g. custom icons).
+
+	Stricter than sanitize_html: only SVG elements and attributes survive, so
+	scripts, event handlers, foreignObject and plain HTML are all stripped.
+	"""
+	if not isinstance(svg, str):
+		return svg
+
+	return nh3.clean(
+		svg,
+		tags=svg_elements,
+		attributes={"*": svg_attributes},
+		strip_comments=True,
+	)
 
 
 def is_json(text):
@@ -225,7 +329,7 @@ def unescape_html(value):
 
 
 # adapted from https://raw.githubusercontent.com/html5lib/html5lib-python/4aa79f113e7486c7ec5d15a6e1777bfe546d3259/html5lib/sanitizer.py
-acceptable_elements = [
+acceptable_elements = {
 	"a",
 	"abbr",
 	"acronym",
@@ -327,9 +431,9 @@ acceptable_elements = [
 	"ul",
 	"var",
 	"video",
-]
+}
 
-mathml_elements = [
+mathml_elements = {
 	"maction",
 	"math",
 	"merror",
@@ -357,9 +461,9 @@ mathml_elements = [
 	"munder",
 	"munderover",
 	"none",
-]
+}
 
-svg_elements = [
+svg_elements = {
 	"a",
 	"animate",
 	"animateColor",
@@ -395,9 +499,9 @@ svg_elements = [
 	"title",
 	"tspan",
 	"use",
-]
+}
 
-acceptable_attributes = [
+acceptable_attributes = {
 	"abbr",
 	"accept",
 	"accept-charset",
@@ -501,7 +605,6 @@ acceptable_attributes = [
 	"prompt",
 	"radiogroup",
 	"readonly",
-	"rel",
 	"repeat-max",
 	"repeat-min",
 	"replace",
@@ -559,15 +662,12 @@ acceptable_attributes = [
 	"itemtype",
 	"itemid",
 	"itemref",
-	"datetime",
 	"data-is-group",
-]
+}
 
-mathml_attributes = [
+mathml_attributes = {
 	"actiontype",
 	"align",
-	"columnalign",
-	"columnalign",
 	"columnalign",
 	"columnlines",
 	"columnspacing",
@@ -587,12 +687,9 @@ mathml_attributes = [
 	"mathbackground",
 	"mathcolor",
 	"mathvariant",
-	"mathvariant",
 	"maxsize",
 	"minsize",
 	"other",
-	"rowalign",
-	"rowalign",
 	"rowalign",
 	"rowlines",
 	"rowspacing",
@@ -603,15 +700,14 @@ mathml_attributes = [
 	"separator",
 	"stretchy",
 	"width",
-	"width",
 	"xlink:href",
 	"xlink:show",
 	"xlink:type",
 	"xmlns",
 	"xmlns:xlink",
-]
+}
 
-svg_attributes = [
+svg_attributes = {
 	"accent-height",
 	"accumulate",
 	"additive",
@@ -754,4 +850,10 @@ svg_attributes = [
 	"y1",
 	"y2",
 	"zoomAndPan",
-]
+}
+
+# Tags whose content is stripped must never also be present in any allow-list of
+# renderable tags, otherwise sanitization would keep dangerous content.
+assert REMOVE_CONTENT_TAGS.isdisjoint(acceptable_elements | mathml_elements | svg_elements), (
+	"content-removal tags must never appear in any allowed tag set"
+)

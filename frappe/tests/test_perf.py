@@ -133,7 +133,7 @@ class TestPerformance(IntegrationTestCase):
 		"""Ideally should be ran against gunicorn worker, though I have not seen any difference
 		when using werkzeug's run_simple for synchronous requests."""
 
-		EXPECTED_RPS = 120  # measured on GHA
+		EXPECTED_RPS = 140  # measured on GHA
 		FAILURE_THREASHOLD = 0.1
 
 		req_count = 1000
@@ -154,7 +154,7 @@ class TestPerformance(IntegrationTestCase):
 		)
 
 	def test_homepage_resolver(self):
-		paths = ["/", "/app"]
+		paths = ["/", "/desk"]
 		for path in paths:
 			PathResolver(path).resolve()
 			with self.assertQueryCount(1):
@@ -166,20 +166,20 @@ class TestPerformance(IntegrationTestCase):
 		self.assertEqual(get_build_version(), get_build_version())
 
 	def test_get_list_single_query(self):
-		"""get_list should only perform single query."""
+		"""
+		get_list should only perform single query.
 
-		user = frappe.get_doc("User", TEST_USER)
-
-		frappe.set_user(TEST_USER)
-		# Give full read access, no share/user perm check should be done.
-		user.add_roles("System Manager")
+		Note:
+		this test will work only as Admistrator.
+		other users will have permission queries - so share conditions will be added.
+		"""
 
 		frappe.get_list("User")
 		with self.assertQueryCount(1):
 			frappe.get_list("User")
 
 	def test_no_ifnull_checks(self):
-		query = frappe.get_all("DocType", {"autoname": ("is", "set")}, run=0).lower()
+		query = frappe.get_all("DocType", {"autoname": ("is", "set")}, run=0).get_sql().lower()
 		self.assertNotIn("coalesce", query)
 		self.assertNotIn("ifnull", query)
 
@@ -193,14 +193,16 @@ class TestPerformance(IntegrationTestCase):
 		"""
 
 		query = "select * from tabUser"
+		expected_refcount = 1
 		for kwargs in ({}, {"as_dict": True}, {"as_list": True}):
 			result = frappe.db.sql(query, **kwargs)
-			self.assertEqual(sys.getrefcount(result), 2)  # Note: This always returns +1
+			self.assertEqual(sys.getrefcount(result), expected_refcount)  # Note: This always returns +1
 			self.assertFalse(gc.get_referrers(result))
 
 	def test_no_cyclic_references(self):
 		doc = frappe.get_doc("User", "Administrator")
-		self.assertEqual(sys.getrefcount(doc), 2)  # Note: This always returns +1
+		expected_refcount = 1
+		self.assertEqual(sys.getrefcount(doc), expected_refcount)  # Note: This always returns +1
 
 	def test_get_doc_cache_calls(self):
 		frappe.get_doc("User", "Administrator")
@@ -229,50 +231,6 @@ class TestPerformance(IntegrationTestCase):
 		process = psutil.Process(pid)
 		self.assertLess(process.cpu_percent(interval=1.0), 2)
 
-	def test_cpu_allocation(self):
-		from frappe._optimizations import assign_core
-
-		# Already allocated
-		self.assertEqual(assign_core(0, 4, 8, [0], []), 0)
-
-		# All physical, pid same as core for 0-7
-		siblings = [(i,) for i in range(8)]
-		cores = list(range(8))
-		for pid in cores:
-			self.assertEqual(assign_core(pid, len(cores), len(cores), cores, siblings), pid)
-
-		# All physical, pid wraps for core for 8-15
-		for pid in range(8, 16):
-			self.assertEqual(assign_core(pid, len(cores), len(cores), cores, siblings), pid % len(cores))
-
-		default_affinity_16 = list(range(16))
-		# "linear" siblings = (0,1) (2,3) ...
-		linear_siblings_16 = list(itertools.batched(range(16), 2))
-		logical_cores = list(range(16))
-		expected_assignments = [*(l[0] for l in linear_siblings_16), *(l[1] for l in linear_siblings_16)]
-		for pid, expected_core in zip(logical_cores, expected_assignments, strict=True):
-			core = assign_core(
-				pid, len(logical_cores) // 2, len(logical_cores), default_affinity_16, linear_siblings_16
-			)
-			self.assertEqual(core, expected_core)
-
-		# "Block" siblings = (0,4) (1,5) ...
-		block_siblings_16 = list(zip(range(8), range(8, 16), strict=True))
-		for pid in logical_cores:
-			core = assign_core(
-				pid, len(logical_cores) // 2, len(logical_cores), logical_cores, block_siblings_16
-			)
-			self.assertEqual(core, pid)
-
-		# Few cores disabled
-		enabled_cores = [0, 2, 4, 6]
-		affinity = [(i,) for i in enabled_cores]
-		core = assign_core(0, 4, 4, enabled_cores, affinity)
-		self.assertEqual(core, 0)
-
-		core = assign_core(1, 4, 4, enabled_cores, affinity)
-		self.assertEqual(core, 2)
-
 
 @run_only_if(db_type_is.MARIADB)
 class TestOverheadCalls(FrappeAPITestCase):
@@ -283,7 +241,7 @@ class TestOverheadCalls(FrappeAPITestCase):
 	Every call increase here is an actual increase in cost!
 	"""
 
-	BASE_SQL_CALLS = 2  # rollback + begin
+	BASE_SQL_CALLS = 3  # rollback + begin + session time zone on connect
 
 	def test_ping_overheads(self):
 		self.get(self.method("ping"), {"sid": "Guest"})

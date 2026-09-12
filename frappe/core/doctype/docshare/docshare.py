@@ -10,6 +10,8 @@ exclude_from_linked_with = True
 
 
 class DocShare(Document):
+	_DOCTYPE_NAME = "DocShare"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -46,7 +48,7 @@ class DocShare(Document):
 
 	def get_doc(self):
 		if not getattr(self, "_doc", None):
-			self._doc = frappe.get_doc(self.share_doctype, self.share_name)
+			self._doc = frappe.get_lazy_doc(self.share_doctype, self.share_name)
 		return self._doc
 
 	def validate_user(self):

@@ -13,6 +13,8 @@ from frappe.model.document import Document
 
 
 class WebsiteTheme(Document):
+	_DOCTYPE_NAME = "Website Theme"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -55,7 +57,7 @@ class WebsiteTheme(Document):
 			not self.custom
 			and frappe.local.conf.get("developer_mode")
 			and not frappe.flags.in_import
-			and not frappe.flags.in_test
+			and not frappe.in_test
 		):
 			self.export_doc()
 
@@ -65,7 +67,7 @@ class WebsiteTheme(Document):
 		return (
 			not self.custom
 			and not frappe.local.conf.get("developer_mode")
-			and not (frappe.flags.in_import or frappe.flags.in_test or frappe.flags.in_migrate)
+			and not (frappe.flags.in_import or frappe.in_test or frappe.flags.in_migrate)
 		)
 
 	def on_trash(self):
@@ -151,7 +153,7 @@ class WebsiteTheme(Document):
 		return [{"name": app, "title": values["title"]} for app, values in apps.items()]
 
 
-def get_active_theme() -> Optional["WebsiteTheme"]:
+def get_active_theme() -> "WebsiteTheme" | None:
 	if website_theme := frappe.get_website_settings("website_theme"):
 		try:
 			return frappe.client_cache.get_doc("Website Theme", website_theme)
@@ -185,7 +187,7 @@ def get_scss_paths():
 	import_path_list = []
 
 	scss_files = ["public/scss/website.scss", "public/scss/website.bundle.scss"]
-	for app in frappe.get_installed_apps():
+	for app in frappe.get_active_apps():
 		for scss_file in scss_files:
 			full_path = frappe.get_app_path(app, scss_file)
 			if path_exists(full_path):

@@ -163,10 +163,15 @@ frappe.ui.form.ScriptManager = class ScriptManager {
 				handlers.new_style.push(fn);
 			});
 		}
-		if (this.frm.cscript && this.frm.cscript[event_name]) {
+		if (frappe.ui.form.handlers["*"] && frappe.ui.form.handlers["*"][event_name]) {
+			$.each(frappe.ui.form.handlers["*"][event_name], function (i, fn) {
+				handlers.new_style.push(fn);
+			});
+		}
+		if (this.frm.cscript?.[event_name]) {
 			handlers.old_style.push(event_name);
 		}
-		if (this.frm.cscript && this.frm.cscript["custom_" + event_name]) {
+		if (this.frm.cscript?.["custom_" + event_name]) {
 			handlers.old_style.push("custom_" + event_name);
 		}
 		return handlers;
@@ -218,6 +223,13 @@ frappe.ui.form.ScriptManager = class ScriptManager {
 					"Select",
 					"Duration",
 					"Time",
+					"Percent",
+					"Phone",
+					"Barcode",
+					"Autocomplete",
+					"Icon",
+					"Color",
+					"Rating",
 				].includes(df.fieldtype) ||
 				df.read_only == 1 ||
 				df.is_virtual == 1;

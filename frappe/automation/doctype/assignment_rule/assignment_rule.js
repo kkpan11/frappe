@@ -37,7 +37,7 @@ frappe.ui.form.on("Assignment Rule", {
 
 		let set_days = (e) => {
 			frm.clear_table("assignment_days");
-			const label = $(e.currentTarget).text();
+			const label = $(e.currentTarget).text().trim();
 			get_days(label).forEach((day) => frm.add_child("assignment_days", { day: day }));
 			frm.refresh_field("assignment_days");
 		};
@@ -67,8 +67,11 @@ frappe.ui.form.on("Assignment Rule", {
 			[{ label: "Owner", value: "owner" }]
 		);
 		if (doctype) {
-			frm.set_fields_as_options("due_date_based_on", doctype, (df) =>
-				["Date", "Datetime"].includes(df.fieldtype)
+			frm.set_fields_as_options(
+				"due_date_based_on",
+				doctype,
+				(df) => ["Date", "Datetime"].includes(df.fieldtype),
+				[{ value: " ", label: " " }]
 			).then((options) =>
 				frm.set_df_property("due_date_based_on", "hidden", !options.length)
 			);

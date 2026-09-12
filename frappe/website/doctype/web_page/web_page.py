@@ -25,6 +25,8 @@ H_TAG_PATTERN = re.compile("<h.>")
 
 
 class WebPage(WebsiteGenerator):
+	_DOCTYPE_NAME = "Web Page"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -125,7 +127,9 @@ class WebPage(WebsiteGenerator):
 			frappe.flags.web_block_scripts = {}
 			frappe.flags.web_block_styles = {}
 			try:
-				context["main_section"] = render_template(context.main_section, context)
+				context["main_section"] = render_template(
+					context.main_section, context, restrict_globals=True
+				)
 				if "<!-- static -->" not in context.main_section:
 					context["no_cache"] = 1
 			except TemplateSyntaxError:

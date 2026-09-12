@@ -1,9 +1,7 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 
-import json
-
-from bs4 import BeautifulSoup
+from typing import Literal
 
 import frappe
 from frappe import _
@@ -25,7 +23,7 @@ def get_notifications():
 		"open_count_doctype": {},
 		"targets": {},
 	}
-	if frappe.flags.in_install or not frappe.get_system_settings("setup_complete"):
+	if frappe.flags.in_install or not frappe.is_setup_complete():
 		return out
 
 	config = get_notification_config()
@@ -64,7 +62,7 @@ def get_notifications_for_doctypes(config, notification_count):
 				try:
 					if isinstance(condition, dict):
 						result = frappe.get_list(
-							d, fields=["count(*) as count"], filters=condition, ignore_ifnull=True
+							d, fields=[{"COUNT": "*", "as": "count"}], filters=condition, ignore_ifnull=True
 						)[0].count
 					else:
 						result = frappe.get_attr(condition)()
@@ -241,7 +239,7 @@ def get_filters_for(doctype):
 
 @frappe.whitelist()
 @frappe.read_only()
-def get_open_count(doctype: str, name: str, items=None):
+def get_open_count(doctype: str, name: str | int, items: str | list[str] | None = None):
 	"""Get count for internal and external links for given transactions
 
 	:param doctype: Reference DocType
@@ -251,8 +249,19 @@ def get_open_count(doctype: str, name: str, items=None):
 	if frappe.flags.in_migrate or frappe.flags.in_install:
 		return {"count": []}
 
-	doc = frappe.get_doc(doctype, name)
-	doc.check_permission()
+	# None of the count queries should take more than 1s individually
+	frappe.db.set_execution_timeout(1)
+
+	try:
+		return _get_linked_document_counts(doctype, name, items)
+	except Exception as e:
+		if frappe.db.is_statement_timeout(e):
+			return {"count": []}
+		raise
+
+
+def _get_linked_document_counts(doctype: str, name: str, items=None):
+	doc = frappe.get_lazy_doc(doctype, name, check_permission=True)
 	meta = doc.meta
 	links = meta.get_dashboard_data()
 
@@ -263,7 +272,7 @@ def get_open_count(doctype: str, name: str, items=None):
 			items.extend(group.get("items"))
 
 	if not isinstance(items, list):
-		items = json.loads(items)
+		items = frappe.parse_json(items)
 
 	out = {
 		"external_links_found": [],
@@ -278,12 +287,13 @@ def get_open_count(doctype: str, name: str, items=None):
 			internal_links_data_for_d = get_internal_links(doc, internal_link_for_doctype, d)
 			if internal_links_data_for_d["count"]:
 				out["internal_links_found"].append(internal_links_data_for_d)
+			elif has_external_link_field(d, links):
+				# pairs can be linked from either side, e.g. a Sales Invoice made
+				# from a Delivery Note (internal) vs one a Delivery Note was made
+				# from (external), so probe the other direction too
+				out["external_links_found"].append(get_external_links(d, name, links))
 			else:
-				try:
-					external_links_data_for_d = get_external_links(d, name, links)
-					out["external_links_found"].append(external_links_data_for_d)
-				except Exception:
-					out["external_links_found"].append({"doctype": d, "open_count": 0, "count": 0})
+				out["external_links_found"].append({"doctype": d, "open_count": 0, "count": 0})
 		else:
 			external_links_data_for_d = get_external_links(d, name, links)
 			out["external_links_found"].append(external_links_data_for_d)
@@ -324,13 +334,38 @@ def get_internal_links(doc, link, link_doctype):
 	return data
 
 
+def get_external_link_fieldname(doctype, links):
+	return links.get("non_standard_fieldnames", {}).get(doctype, links.get("fieldname"))
+
+
+def has_external_link_field(doctype, links):
+	"""Whether `doctype` (or one of its child tables) has the field that links it back."""
+	fieldname = get_external_link_fieldname(doctype, links)
+	if not fieldname:
+		return False
+	return frappe.get_meta(doctype).has_field(fieldname) or bool(
+		get_child_doctypes_with_field(doctype, fieldname)
+	)
+
+
+def get_child_doctypes_with_field(doctype, fieldname):
+	"""Child tables of `doctype` carrying `fieldname`, empty when the parent itself has it."""
+	meta = frappe.get_meta(doctype)
+	if meta.has_field(fieldname):
+		return []
+	return [df.options for df in meta.get_table_fields() if frappe.get_meta(df.options).has_field(fieldname)]
+
+
 def get_external_links(doctype, name, links):
-	fieldname = links.get("non_standard_fieldnames", {}).get(doctype, links.get("fieldname"))
-	filters = {fieldname: name}
+	fieldname = get_external_link_fieldname(doctype, links)
 
 	# updating filters based on dynamic_links
-	if dynamic_link_filters := get_dynamic_link_filters(doctype, links, fieldname):
-		filters.update(dynamic_link_filters)
+	filters = get_dynamic_link_filters(doctype, links, fieldname) or {}
+
+	if len(child_doctypes := get_child_doctypes_with_field(doctype, fieldname)) > 1:
+		return get_external_links_in_child_tables(doctype, name, fieldname, child_doctypes, filters)
+
+	filters[fieldname] = name
 
 	total_count = get_doc_count(doctype, filters)
 
@@ -342,18 +377,42 @@ def get_external_links(doctype, name, links):
 	return {"doctype": doctype, "count": total_count, "open_count": open_count}
 
 
-def get_doc_count(doctype, filters):
-	return len(
-		frappe.get_all(
+def get_external_links_in_child_tables(doctype, name, fieldname, child_doctypes, filters):
+	"""A filter on a fieldname that several child tables share resolves to whichever of them
+	is scanned first, so match the link in any of them and let the client route by name."""
+	try:
+		names = frappe.get_list(
 			doctype,
-			fields="name",
 			filters=filters,
+			or_filters=[[child_doctype, fieldname, "=", name] for child_doctype in child_doctypes],
 			limit=100,
 			distinct=True,
 			ignore_ifnull=True,
 			order_by=None,
+			pluck="name",
 		)
-	)
+	except Exception as e:
+		if frappe.db.is_statement_timeout(e):
+			return {"doctype": doctype, "count": "?", "open_count": 0}
+		raise
+
+	open_count = 0
+	if names and (open_count_filters := get_filters_for(doctype)):
+		open_count = get_doc_count(doctype, {"name": ("in", names), **open_count_filters})
+
+	return {"doctype": doctype, "count": len(names), "open_count": open_count, "names": names}
+
+
+def get_doc_count(doctype, filters) -> int | Literal["?"]:
+	try:
+		docs = frappe.get_all(
+			doctype, filters=filters, limit=100, distinct=True, ignore_ifnull=True, order_by=None
+		)
+		return len(docs)
+	except Exception as e:
+		if frappe.db.is_statement_timeout(e):  # Skip fetching correct count if it's too slow
+			return "?"
+		raise
 
 
 def get_dynamic_link_filters(doctype, links, fieldname):
@@ -375,7 +434,12 @@ def get_dynamic_link_filters(doctype, links, fieldname):
 	return {doctype_fieldname: doctype_value}
 
 
-def notify_mentions(ref_doctype, ref_name, content):
+def notify_mentions(ref_doctype, ref_name, content, source_doctype=None, source_name=None):
+	"""Notify users mentioned in `content`.
+	`source_doctype` / `source_name` identify the record the mention was
+	written in (e.g. a Comment) when that is not the reference document
+	itself.
+	"""
 	if ref_doctype and ref_name and content:
 		mentions = extract_mentions(content)
 
@@ -402,6 +466,8 @@ def notify_mentions(ref_doctype, ref_name, content):
 			"type": "Mention",
 			"document_type": ref_doctype,
 			"document_name": ref_name,
+			"source_doctype": source_doctype,
+			"source_name": source_name,
 			"subject": notification_message,
 			"from_user": frappe.session.user,
 			"email_content": content,
@@ -412,6 +478,8 @@ def notify_mentions(ref_doctype, ref_name, content):
 
 def extract_mentions(txt):
 	"""Find all instances of @mentions in the html."""
+	from bs4 import BeautifulSoup
+
 	soup = BeautifulSoup(txt, "html.parser")
 	emails = []
 	for mention in soup.find_all(class_="mention"):

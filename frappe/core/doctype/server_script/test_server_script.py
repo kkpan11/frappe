@@ -6,7 +6,8 @@ import frappe
 from frappe.core.doctype.scheduled_job_type.scheduled_job_type import ScheduledJobType, sync_jobs
 from frappe.core.doctype.server_script.server_script import ServerScript
 from frappe.frappeclient import FrappeClient, FrappeException
-from frappe.tests import IntegrationTestCase, UnitTestCase
+from frappe.tests import IntegrationTestCase
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import get_site_url
 
 scripts = [
@@ -108,15 +109,6 @@ doc.save()
 ]
 
 
-class UnitTestServerScript(UnitTestCase):
-	"""
-	Unit tests for ServerScript.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
-
-
 class TestServerScript(IntegrationTestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -157,6 +149,7 @@ class TestServerScript(IntegrationTestCase):
 		self.assertEqual(role.disabled, 1)
 		self.assertEqual(role.desk_access, 0)
 
+	@requires_test_service(TestService.WEB_SERVER)
 	def test_api(self):
 		response = requests.post(get_site_url(frappe.local.site) + "/api/method/test_server_script")
 		self.assertEqual(response.status_code, 200)
@@ -166,10 +159,8 @@ class TestServerScript(IntegrationTestCase):
 		self.assertEqual(frappe.get_doc("Server Script", "test_return_value").execute_method(), "hello")
 
 	def test_permission_query(self):
-		if frappe.conf.db_type != "postgres":
-			self.assertTrue("where (1 = 1)" in frappe.db.get_list("ToDo", run=False))
-		else:
-			self.assertTrue("where (1 = '1')" in frappe.db.get_list("ToDo", run=False))
+		sql = frappe.db.get_list("ToDo", run=False).get_sql()
+		self.assertTrue("where (1 = 1)" in sql.lower())
 		self.assertTrue(isinstance(frappe.db.get_list("ToDo"), list))
 
 	def test_attribute_error(self):
@@ -269,6 +260,7 @@ frappe.qb.from_(todo).select(todo.name).where(todo.name == "{todo.name}").run()
 		script.insert()
 		script.execute_method()
 
+	@requires_test_service(TestService.WEB_SERVER)
 	def test_server_script_rate_limiting(self):
 		script1 = frappe.get_doc(
 			doctype="Server Script",
@@ -383,6 +375,16 @@ frappe.qb.from_(todo).select(todo.name).where(todo.name == "{todo.name}").run()
 		script.save()
 		self.assertEqual(job.reload().frequency, "Cron")
 		self.assertEqual(job.reload().cron_format, script.cron_format)
+
+		script.queue = "long"
+		script.save()
+		self.assertEqual(job.reload().queue, "long")
+		self.assertEqual(job.get_queue_name(), "long")
+
+		script.queue = ""
+		script.save()
+		self.assertFalse(job.reload().queue)
+		self.assertEqual(job.get_queue_name(), "default")
 
 		# manually disable
 

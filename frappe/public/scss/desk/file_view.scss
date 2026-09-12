@@ -7,6 +7,10 @@
 		}
 	}
 
+	.list-header-subject .list-subject input {
+		margin-left: 10px;
+	}
+
 	.list-paging-area {
 		padding: var(--padding-md) var(--padding-sm);
 	}
@@ -39,13 +43,12 @@
 				@include flex(flex, space-between, null, column);
 				width: 100%;
 				border: 1px solid var(--border-color);
-				border-radius: var(--border-radius);
+				border-radius: var(--radius);
 				text-decoration: none;
 
 				.file-header {
 					position: absolute;
-					left: var(--padding-sm);
-					top: var(--padding-sm);
+					padding: var(--padding-sm);
 					z-index: 1;
 
 					.list-row-checkbox {
@@ -57,6 +60,11 @@
 							display: block;
 						}
 					}
+
+					.copy-file-url {
+						visibility: hidden;
+						display: flex;
+					}
 				}
 
 				.file-footer {
@@ -66,7 +74,7 @@
 
 				.file-body {
 					height: 105px;
-					@include flex(flex, null, center, row);
+					@include flex(flex, null, null, row);
 					background: var(--bg-color);
 				}
 
@@ -81,13 +89,12 @@
 				}
 
 				.file-image {
-					max-height: 100%;
+					height: 100%;
 					display: flex;
 					width: 100%;
 					min-width: 100%;
 
 					img {
-						border-radius: var(--border-radius) var(--border-radius) 0 0;
 						object-position: top;
 						object-fit: cover;
 						margin: 0 auto;
@@ -107,6 +114,10 @@
 
 				img {
 					filter: opacity(15%);
+				}
+
+				.copy-file-url {
+					visibility: visible;
 				}
 			}
 

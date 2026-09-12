@@ -6,19 +6,10 @@ import json
 import frappe
 from frappe.core.doctype.doctype.doctype import InvalidFieldNameError
 from frappe.core.doctype.doctype.test_doctype import new_doctype
-from frappe.tests import IntegrationTestCase, UnitTestCase
+from frappe.tests import IntegrationTestCase
 from frappe.tests.utils import make_test_records_for_doctype
 
 EXTRA_TEST_RECORD_DEPENDENCIES = ["Custom Field", "Property Setter"]
-
-
-class UnitTestCustomizeForm(UnitTestCase):
-	"""
-	Unit tests for CustomizeForm.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
 
 
 class TestCustomizeForm(IntegrationTestCase):
@@ -64,7 +55,7 @@ class TestCustomizeForm(IntegrationTestCase):
 
 		d = self.get_customize_form("Event")
 		self.assertEqual(d.doc_type, "Event")
-		self.assertEqual(len(d.get("fields")), 38)
+		self.assertEqual(len(d.get("fields")), 49)
 
 		d = self.get_customize_form("Event")
 		self.assertEqual(d.doc_type, "Event")
@@ -344,7 +335,7 @@ class TestCustomizeForm(IntegrationTestCase):
 		self.assertFalse([d.name for d in (user_group.links or []) if d.link_doctype == "User Group Member"])
 
 	def test_custom_action(self):
-		test_route = "/app/List/DocType"
+		test_route = "/desk/List/DocType"
 
 		# create a dummy action (route)
 		d = self.get_customize_form("Event")

@@ -9,6 +9,7 @@ from email.utils import formataddr
 import frappe
 from frappe import _
 from frappe.desk.query_report import build_xlsx_data
+from frappe.email.email_body import get_formatted_html
 from frappe.model.document import Document
 from frappe.model.naming import append_number_if_name_exists
 from frappe.utils import (
@@ -29,10 +30,13 @@ from frappe.utils import (
 	validate_email_address,
 )
 from frappe.utils.csvutils import to_csv
+from frappe.utils.pdf import get_pdf
 from frappe.utils.xlsxutils import make_xlsx
 
 
 class AutoEmailReport(Document):
+	_DOCTYPE_NAME = "Auto Email Report"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -51,7 +55,7 @@ class AutoEmailReport(Document):
 		enabled: DF.Check
 		filter_meta: DF.Text | None
 		filters: DF.Text | None
-		format: DF.Literal["HTML", "XLSX", "CSV"]
+		format: DF.Literal["HTML", "XLSX", "CSV", "PDF"]
 		frequency: DF.Literal["Daily", "Weekdays", "Weekly", "Monthly"]
 		from_date_field: DF.Literal[None]
 		no_of_rows: DF.Int
@@ -109,7 +113,7 @@ class AutoEmailReport(Document):
 
 	def validate_report_format(self):
 		"""check if user has select correct report format"""
-		valid_report_formats = ["HTML", "XLSX", "CSV"]
+		valid_report_formats = ["HTML", "XLSX", "CSV", "PDF"]
 		if self.format not in valid_report_formats:
 			frappe.throw(
 				_("{0} is not a valid report format. Report format should one of the following {1}").format(
@@ -122,7 +126,9 @@ class AutoEmailReport(Document):
 		filters = frappe.parse_json(self.filters) if self.filters else {}
 		filter_meta = frappe.parse_json(self.filter_meta) if self.filter_meta else {}
 		throw_list = [
-			meta["label"] for meta in filter_meta if meta.get("reqd") and not filters.get(meta["fieldname"])
+			meta["label"]
+			for meta in filter_meta
+			if (meta.get("reqd") and (not meta.get("hidden"))) and not filters.get(meta["fieldname"])
 		]
 		if throw_list:
 			frappe.throw(
@@ -155,9 +161,9 @@ class AutoEmailReport(Document):
 		)
 
 		# add serial numbers
-		columns.insert(0, frappe._dict(fieldname="idx", label="", width="30px"))
+		columns.insert(0, frappe._dict(fieldname="sr", label=_("Sr"), fieldtype="Int", width="30px"))
 		for i in range(len(data)):
-			data[i]["idx"] = i + 1
+			data[i]["sr"] = i + 1
 
 		if len(data) == 0 and self.send_if_data:
 			return None
@@ -167,22 +173,40 @@ class AutoEmailReport(Document):
 			columns = update_field_types(columns)
 			return self.get_html_table(columns, data)
 
-		elif self.format == "XLSX":
-			report_data = frappe._dict()
-			report_data["columns"] = columns
-			report_data["result"] = data
+		elif self.format in ("XLSX", "CSV"):
+			report_data = frappe._dict(
+				{
+					"report_name": self.report,
+					"filters": self.filters,
+					"columns": columns,
+					"result": data,
+				}
+			)
+			is_excel = self.format == "XLSX"
 
-			xlsx_data, column_widths = build_xlsx_data(report_data, [], 1, ignore_visible_idx=True)
-			xlsx_file = make_xlsx(xlsx_data, "Auto Email Report", column_widths=column_widths)
-			return xlsx_file.getvalue()
+			xlsx_data, column_widths, styles = build_xlsx_data(
+				report_data, [], 1, ignore_visible_idx=True, build_styles=is_excel
+			)
 
-		elif self.format == "CSV":
-			report_data = frappe._dict()
-			report_data["columns"] = columns
-			report_data["result"] = data
+			if is_excel:
+				xlsx_file = make_xlsx(
+					xlsx_data, "Auto Email Report", column_widths=column_widths, styles=styles
+				)
 
-			xlsx_data, column_widths = build_xlsx_data(report_data, [], 1, ignore_visible_idx=True)
-			return to_csv(xlsx_data)
+				return xlsx_file.getvalue()
+
+			else:
+				return to_csv(xlsx_data)
+
+		elif self.format == "PDF":
+			columns, data = make_links(columns, data)
+			columns = update_field_types(columns)
+			options = {}
+
+			if len(columns) > 8:
+				options["orientation"] = "landscape"
+			html = get_formatted_html(subject=self.name, message=self.get_html_table(columns, data))
+			return get_pdf(html, options, smart_shrinking=True)
 
 		else:
 			frappe.throw(_("Invalid Output Format"))
@@ -279,7 +303,7 @@ class AutoEmailReport(Document):
 
 
 @frappe.whitelist()
-def download(name):
+def download(name: str):
 	"""Download report locally"""
 	auto_email_report = frappe.get_doc("Auto Email Report", name)
 	auto_email_report.check_permission()
@@ -295,7 +319,7 @@ def download(name):
 
 
 @frappe.whitelist()
-def send_now(name):
+def send_now(name: str):
 	"""Send Auto Email report now"""
 	auto_email_report = frappe.get_doc("Auto Email Report", name)
 	auto_email_report.check_permission()
@@ -339,8 +363,8 @@ def process_auto_email_report(report):
 
 def send_monthly():
 	"""Check reports to be sent monthly"""
-	for report in frappe.get_all("Auto Email Report", {"enabled": 1, "frequency": "Monthly"}):
-		frappe.get_doc("Auto Email Report", report.name).send()
+	for report in frappe.get_docs("Auto Email Report", filters={"enabled": 1, "frequency": "Monthly"}):
+		report.send()
 
 
 def make_links(columns, data):

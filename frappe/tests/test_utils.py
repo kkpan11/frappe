@@ -5,7 +5,7 @@ import io
 import json
 import os
 import sys
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from enum import Enum
 from io import StringIO
@@ -19,9 +19,8 @@ from PIL import Image
 import frappe
 from frappe.installer import parse_app_name
 from frappe.model.document import Document
-from frappe.tests import IntegrationTestCase, MockedRequestTestCase
+from frappe.tests import IntegrationTestCase, MockedRequestTestCase, UnitTestCase
 from frappe.utils import (
-	add_trackers_to_url,
 	ceil,
 	dict_to_str,
 	execute_in_shell,
@@ -30,11 +29,13 @@ from frappe.utils import (
 	format_timedelta,
 	get_bench_path,
 	get_file_timestamp,
-	get_gravatar,
+	get_identicon,
+	get_link_to_report,
+	get_safe_filters,
 	get_site_info,
 	get_sites,
 	get_url,
-	map_trackers,
+	is_valid_iban,
 	money_in_words,
 	parse_and_map_trackers_from_url,
 	parse_timedelta,
@@ -53,13 +54,18 @@ from frappe.utils.change_log import (
 )
 from frappe.utils.data import (
 	add_to_date,
+	add_trackers_to_url,
 	add_years,
 	cast,
 	cint,
+	comma_and,
+	comma_or,
+	compare,
 	cstr,
 	duration_to_seconds,
 	evaluate_filters,
 	expand_relative_urls,
+	format_duration,
 	get_datetime,
 	get_first_day_of_week,
 	get_time,
@@ -69,8 +75,10 @@ from frappe.utils.data import (
 	get_year_ending,
 	getdate,
 	is_invalid_date_string,
+	map_trackers,
 	now_datetime,
 	nowtime,
+	orjson_dumps,
 	pretty_date,
 	rounded,
 	sha256_hash,
@@ -84,6 +92,7 @@ from frappe.utils.image import optimize_image, strip_exif_data
 from frappe.utils.make_random import can_make, get_random, how_many
 from frappe.utils.response import json_handler
 from frappe.utils.synchronization import LockTimeoutError, filelock
+from frappe.utils.typing_validations import FrappeTypeError, validate_argument_types
 
 
 class Capturing(list):
@@ -232,6 +241,181 @@ class TestFilters(IntegrationTestCase):
 		}
 		self.assertFalse(evaluate_filters(doc, [("last_password_reset_date", "Timespan", "today")]))
 
+	def test_between_operator(self):
+		"""Test 'between' operator for inclusive range checks."""
+		# Numbers
+		self.assertTrue(compare(5, "between", [1, 10]))
+		self.assertTrue(compare(1, "between", [1, 10]))
+		self.assertTrue(compare(10, "between", [1, 10]))
+		self.assertFalse(compare(0, "between", [1, 10]))
+		self.assertFalse(compare(11, "between", [1, 10]))
+		self.assertFalse(compare(None, "between", [1, 10]))
+
+		# Numbers with fieldtype casting
+		self.assertTrue(compare("5", "between", ["1", "10"], "Int"))
+		self.assertFalse(compare("0", "between", ["1", "10"], "Int"))
+
+		# Dates
+		self.assertTrue(compare("2024-06-15", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertTrue(compare("2024-01-01", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertTrue(compare("2024-12-31", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertFalse(compare("2023-12-31", "between", ["2024-01-01", "2024-12-31"], "Date"))
+		self.assertFalse(compare(None, "between", ["2024-01-01", "2024-12-31"], "Date"))
+
+		# Datetime: date-only upper bound includes the full final day (matches DB between)
+		self.assertTrue(compare("2024-12-31 15:30:00", "between", ["2024-01-01", "2024-12-31"], "Datetime"))
+		self.assertTrue(compare("2024-12-31 23:59:59", "between", ["2024-01-01", "2024-12-31"], "Datetime"))
+		self.assertFalse(compare("2025-01-01 00:00:00", "between", ["2024-01-01", "2024-12-31"], "Datetime"))
+		# Explicit datetime upper bound is not expanded to end-of-day
+		self.assertFalse(
+			compare(
+				"2024-12-31 15:30:00",
+				"between",
+				["2024-01-01 00:00:00", "2024-12-31 12:00:00"],
+				"Datetime",
+			)
+		)
+
+		# evaluate_filters: API lowercase and UI capitalized form
+		doc = {"doctype": "User", "birth_date": "2024-06-15"}
+		self.assertTrue(evaluate_filters(doc, [("birth_date", "between", ["2024-01-01", "2024-12-31"])]))
+		self.assertTrue(evaluate_filters(doc, [("birth_date", "Between", ["2024-01-01", "2024-12-31"])]))
+		self.assertFalse(evaluate_filters(doc, [("birth_date", "between", ["2025-01-01", "2025-12-31"])]))
+
+	def test_is_operator(self):
+		"""Test 'is' operator for checking if values are set or not set."""
+		# Test "is set" with different fieldtypes and values
+		self.assertTrue(compare("1", "is", "set", "Int"))
+		self.assertTrue(compare(1, "is", "set", "Int"))
+		self.assertTrue(compare(0, "is", "set", "Int"))  # 0 is considered "set"
+		self.assertTrue(compare("hello", "is", "set", "Data"))
+		self.assertTrue(compare(0.0, "is", "set", "Float"))
+
+		# Test "is set" with unset values - None should always be "not set" regardless of fieldtype
+		self.assertFalse(compare(None, "is", "set", "Int"))
+		self.assertFalse(compare(None, "is", "set", "Float"))
+		self.assertFalse(compare(None, "is", "set", "Check"))
+		self.assertFalse(compare(None, "is", "set", "Data"))
+		self.assertFalse(compare("", "is", "set"))
+		self.assertFalse(compare("", "is", "set", "Data"))
+		self.assertFalse(compare(None, "is", "set"))
+
+		# Test "is not set" with set values
+		self.assertFalse(compare("1", "is", "not set", "Int"))
+		self.assertFalse(compare(1, "is", "not set", "Int"))
+		self.assertFalse(compare(0, "is", "not set", "Int"))
+		self.assertFalse(compare("hello", "is", "not set", "Data"))
+		self.assertFalse(compare(0.0, "is", "not set", "Float"))
+
+		# Test "is not set" with unset values - None should always be "not set" regardless of fieldtype
+		self.assertTrue(compare(None, "is", "not set", "Int"))
+		self.assertTrue(compare(None, "is", "not set", "Float"))
+		self.assertTrue(compare(None, "is", "not set", "Check"))
+		self.assertTrue(compare(None, "is", "not set", "Data"))
+		self.assertTrue(compare("", "is", "not set"))
+		self.assertTrue(compare("", "is", "not set", "Data"))
+		self.assertTrue(compare(None, "is", "not set"))
+
+	def test_in_operators(self):
+		"""Test 'in' and 'not in' operators with and without fieldtype casting."""
+		test_list = ["a", "b", "c"]
+
+		# Test "in" operator without fieldtype
+		self.assertTrue(compare("a", "in", test_list))
+		self.assertFalse(compare("", "in", test_list))
+		self.assertFalse(compare("d", "in", test_list))
+		self.assertFalse(compare(None, "in", test_list))
+
+		# Test "not in" operator without fieldtype
+		self.assertFalse(compare("a", "not in", test_list))
+		self.assertTrue(compare("", "not in", test_list))
+		self.assertTrue(compare("d", "not in", test_list))
+		self.assertTrue(compare(None, "not in", test_list))
+
+		# Test "in" operator with fieldtype casting - only first value should be cast
+		string_list = ["1", "2", "3"]
+		self.assertTrue(compare(1, "in", string_list, "Data"))
+		self.assertTrue(compare("2", "in", string_list, "Data"))
+		self.assertFalse(compare(4, "in", string_list, "Data"))
+
+		# Test type mismatch: Int fieldtype with string list (val2 is NOT cast)
+		mixed_list = ["1", "2", "3"]
+		self.assertFalse(compare("1", "in", mixed_list, "Int"))
+		self.assertFalse(compare(1, "in", mixed_list, "Int"))
+
+		# Test with matching types: Int fieldtype with int list
+		int_list = [1, 2, 3]
+		self.assertTrue(compare("1", "in", int_list, "Int"))
+		self.assertTrue(compare(2, "in", int_list, "Int"))
+		self.assertFalse(compare("4", "in", int_list, "Int"))
+
+		# Test "not in" operator with fieldtype casting
+		self.assertFalse(compare(1, "not in", string_list, "Data"))
+		self.assertFalse(compare("2", "not in", string_list, "Data"))
+		self.assertTrue(compare(4, "not in", string_list, "Data"))
+
+		# Test "not in" with type mismatch
+		self.assertTrue(compare("1", "not in", mixed_list, "Int"))
+		self.assertFalse(compare("1", "not in", int_list, "Int"))
+
+		# Test with Float fieldtype
+		float_list = [1.5, 2.5, 3.5]
+		self.assertTrue(compare("1.5", "in", float_list, "Float"))
+		self.assertFalse(compare("4.5", "in", float_list, "Float"))
+
+		# Test None with "in"/"not in" operators - None should not be cast
+		self.assertFalse(compare(None, "in", [""], "Data"))
+		self.assertFalse(compare(None, "in", [0], "Int"))
+		self.assertFalse(compare(None, "in", [0.0], "Float"))
+		self.assertFalse(compare(None, "in", ["", "test"], "Data"))
+		self.assertTrue(compare(None, "in", [None, "test"], "Data"))
+
+		# Test "not in" with None
+		self.assertTrue(compare(None, "not in", [""], "Data"))
+		self.assertTrue(compare(None, "not in", [0], "Int"))
+		self.assertTrue(compare(None, "not in", [0.0], "Float"))
+		self.assertTrue(compare(None, "not in", ["", "test"], "Data"))
+		self.assertFalse(compare(None, "not in", [None, "test"], "Data"))
+
+	def test_is_operator_case_insensitive(self):
+		"""Test that 'is' operator patterns are case insensitive."""
+		self.assertTrue(compare("value", "is", "SET"))
+		self.assertTrue(compare("value", "is", "Set"))
+		self.assertTrue(compare("value", "is", "set"))
+
+		self.assertTrue(compare(None, "is", "NOT SET"))
+		self.assertTrue(compare(None, "is", "Not Set"))
+		self.assertTrue(compare(None, "is", "not set"))
+
+	def test_get_link_to_report_with_between_filter(self):
+		filters = {
+			"creation": [["between", ["2024-01-01", "2024-12-31"]]],
+		}
+		link = get_link_to_report(name="ToDo", filters=filters)
+		self.assertIn('creation=["between",["2024-01-01","2024-12-31"]]', link)
+
+	def test_safe_filters_scientific_notation(self):
+		self.assertEqual(get_safe_filters("3E002"), "3E002")
+		self.assertEqual(get_safe_filters("1E5"), "1E5")
+		self.assertEqual(get_safe_filters("2e10"), "2e10")
+		self.assertEqual(get_safe_filters("1.5"), "1.5")
+		self.assertEqual(get_safe_filters("Infinity"), "Infinity")
+		self.assertEqual(get_safe_filters("NaN"), "NaN")
+
+	def test_safe_filters_json(self):
+		self.assertEqual(get_safe_filters('{"name": "ABC"}'), {"name": "ABC"})
+		self.assertEqual(get_safe_filters('[["name", "=", "ABC"]]'), [["name", "=", "ABC"]])
+		# FrappeClient encodes scalar filters via frappe.as_json — must still unwrap
+		self.assertEqual(get_safe_filters('"ABC"'), "ABC")
+		self.assertIsNone(get_safe_filters("null"))
+		self.assertIs(get_safe_filters("true"), True)
+		self.assertIs(get_safe_filters("false"), False)
+
+	def test_safe_filters_non_string(self):
+		self.assertEqual(get_safe_filters({"name": "ABC"}), {"name": "ABC"})
+		self.assertEqual(get_safe_filters([["name", "=", "ABC"]]), [["name", "=", "ABC"]])
+		self.assertIsNone(get_safe_filters(None))
+
 
 class TestMoney(IntegrationTestCase):
 	def test_money_in_words(self):
@@ -268,6 +452,11 @@ class TestMoney(IntegrationTestCase):
 					expected_words,
 					f"{words} is not the same as {expected_words}",
 				)
+
+	def test_money_in_words_without_fraction(self):
+		# VND doesn't have fractions
+		words = money_in_words("42.01", "VND")
+		self.assertEqual(words, "VND Forty Two only.")
 
 
 class TestDataManipulation(IntegrationTestCase):
@@ -353,7 +542,7 @@ class TestMathUtils(IntegrationTestCase):
 		self.assertEqual(floor(22.7330), 22)
 		self.assertEqual(floor("24.7"), 24)
 		self.assertEqual(floor("26.7"), 26)
-		self.assertEqual(floor(Decimal(29.45)), 29)
+		self.assertEqual(floor(Decimal("29.45")), 29)
 
 	def test_ceil(self):
 		from decimal import Decimal
@@ -363,7 +552,7 @@ class TestMathUtils(IntegrationTestCase):
 		self.assertEqual(ceil(22.7330), 23)
 		self.assertEqual(ceil("24.7"), 25)
 		self.assertEqual(ceil("26.7"), 27)
-		self.assertEqual(ceil(Decimal(29.45)), 30)
+		self.assertEqual(ceil(Decimal("29.45")), 30)
 
 
 class TestHTMLUtils(IntegrationTestCase):
@@ -383,7 +572,7 @@ class TestHTMLUtils(IntegrationTestCase):
 		sample = """<h1>Hello</h1><p>Para</p><a href="http://test.com">text</a>"""
 		clean = clean_email_html(sample)
 		self.assertTrue("<h1>Hello</h1>" in clean)
-		self.assertTrue('<a href="http://test.com">text</a>' in clean)
+		self.assertTrue('<a href="http://test.com" rel="noopener noreferrer">text</a>' in clean)
 
 	def test_sanitize_html(self):
 		from frappe.utils.html_utils import sanitize_html
@@ -391,6 +580,75 @@ class TestHTMLUtils(IntegrationTestCase):
 		clean = sanitize_html("<ol data-list='ordered' unknown_attr='xyz'></ol>")
 		self.assertIn("ordered", clean)
 		self.assertNotIn("xyz", clean)
+
+		# content that happens to parse as JSON is still sanitized when it carries tags
+		self.assertNotIn("<script>", sanitize_html('"<script>alert(1)</script>"'))
+		self.assertNotIn("<script>", sanitize_html('["<script>alert(1)</script>"]'))
+		self.assertNotIn("<script>", sanitize_html('{"x": "<script>alert(1)</script>"}'))
+
+		# tag-free content (including JSON) is returned unchanged
+		self.assertEqual(sanitize_html('[["name", "=", "x"]]'), '[["name", "=", "x"]]')
+		self.assertEqual(sanitize_html("plain text"), "plain text")
+
+	def test_sanitize_html_payload(self):
+		import json
+
+		from frappe.utils.html_utils import sanitize_html, sanitize_html_payload
+
+		# a web form submission: the Text Editor value carries a quoted attribute, and
+		# sanitizing the serialized payload would rewrite that quote as `&quot;` and
+		# leave the JSON unparseable
+		payload = json.dumps({"requirement": '<div class="ql-editor read-mode"><p>Hi</p></div>'})
+		self.assertEqual(sanitize_html_payload(payload), payload)
+		self.assertEqual(json.loads(sanitize_html_payload(payload)), json.loads(payload))
+
+		# markup inside a payload is still sanitized, at every depth
+		for unsafe in (
+			'"<script>alert(1)</script>"',
+			'["<script>alert(1)</script>"]',
+			'{"x": "<script>alert(1)</script>"}',
+			'{"a": {"b": ["<img src=x onerror=alert(1)>"]}}',
+		):
+			clean = sanitize_html_payload(unsafe)
+			self.assertNotIn("<script>", clean)
+			self.assertNotIn("onerror", clean)
+
+		# a payload nested inside another payload is handled too
+		nested = json.dumps({"args": json.dumps({"desc": "<script>alert(1)</script>"})})
+		self.assertNotIn("<script>", sanitize_html_payload(nested))
+		self.assertEqual(json.loads(json.loads(sanitize_html_payload(nested))["args"])["desc"], "")
+
+		# tag-free content is returned unchanged
+		for untouched in ('[["name", "=", "x"]]', "plain text", "1-10", "", "null"):
+			self.assertEqual(sanitize_html_payload(untouched), untouched)
+
+		# content that is not JSON is sanitized exactly as before
+		html = "<script>alert(1)</script><p>hi</p>"
+		self.assertEqual(sanitize_html_payload(html), sanitize_html(html))
+
+		# non-strings are left alone
+		self.assertEqual(sanitize_html_payload(None), None)
+
+		# a guest can post arbitrarily nested JSON cheaply (two bytes a level), so the
+		# walk is bounded; past the bound it sanitizes the text as one blob instead of
+		# running the interpreter out of stack
+		self.assertEqual(sanitize_html_payload("[" * 5000 + "]" * 5000), "[" * 5000 + "]" * 5000)
+		buried = json.dumps(json.loads("[" * 800 + '"<script>alert(1)</script>"' + "]" * 800))
+		self.assertNotIn("<script>", sanitize_html_payload(buried))
+
+		# a payload at a realistic depth is still walked, not treated as one blob
+		nested_doc = json.dumps({"doc": {"items": [{"description": '<div class="x"><p>hi</p></div>'}]}})
+		self.assertEqual(sanitize_html_payload(nested_doc), nested_doc)
+
+	def test_sanitize_svg(self):
+		from frappe.utils.html_utils import sanitize_svg
+
+		clean = sanitize_svg('<svg onload="alert(1)"><script>alert(1)</script><circle r="4"/></svg>')
+		self.assertIn("<circle", clean)
+		self.assertNotIn("script", clean)
+		self.assertNotIn("onload", clean)
+
+		self.assertIsNone(sanitize_svg(None))
 
 
 class TestValidationUtils(IntegrationTestCase):
@@ -452,6 +710,86 @@ class TestValidationUtils(IntegrationTestCase):
 			"erp+Job%20Applicant=JA00004@frappe.com",
 		)
 
+		# RFC 5322 format - Display name with comma (main bug fix)
+		self.assertEqual(
+			validate_email_address('"Lastname, Firstname" <test@example.com>'), "test@example.com"
+		)
+		self.assertEqual(validate_email_address('"Doe, John" <john.doe@example.com>'), "john.doe@example.com")
+
+		# RFC 5322 format - Display name without comma
+		self.assertEqual(validate_email_address("Test User <test@example.com>"), "test@example.com")
+
+		# RFC 5322 format - Multiple emails
+		self.assertEqual(
+			validate_email_address('"Last, First" <test1@example.com>, "Another, Name" <test2@example.com>'),
+			"test1@example.com, test2@example.com",
+		)
+
+		# RFC 5322 format - Mixed with plain emails
+		self.assertEqual(
+			validate_email_address("Test User <test@example.com>, plain@example.com"),
+			"test@example.com, plain@example.com",
+		)
+
+		# Emails with newlines
+		self.assertEqual(
+			validate_email_address("test1@example.com\ntest2@example.com"),
+			"test1@example.com, test2@example.com",
+		)
+
+		# Undisclosed recipients should be filtered
+		self.assertEqual(validate_email_address("undisclosed-recipients:;"), "")
+		self.assertEqual(
+			validate_email_address("test@example.com, undisclosed-recipients:;"), "test@example.com"
+		)
+
+		# Recover valid addresses from a list that contains malformed entries.
+		# Previously a single bad entry (here: `foo@bar.baz@baz`) caused strict
+		# mode to drop the whole list including the valid `bar@bar.baz`.
+		self.assertEqual(
+			validate_email_address("invalid, foo@bar.baz@baz, bar@bar.baz"),
+			"bar@bar.baz",
+		)
+
+		# Quoted display name preserved on the slow path: one entry is bad
+		# (`bad@@email`), but the valid `john@example.com` must still be
+		# recovered without the quoted comma in the display name corrupting
+		# the split.
+		self.assertEqual(
+			validate_email_address('"Smith, John" <john@example.com>, bad@@email'),
+			"john@example.com",
+		)
+
+		# Silently-truncated inputs must be rejected, not sanitized.
+		# `alice@example.com)` should NOT become `alice@example.com` just
+		# because the parser can extract a clean prefix.
+		self.assertFalse(validate_email_address("alice@example.com)"))
+		self.assertFalse(validate_email_address("alice@example.com (unclosed comment"))
+		self.assertFalse(validate_email_address("alice@[192.168.0.1"))
+
+		# Trailing garbage after a valid prefix must be rejected. The parser
+		# returns these addrs as-is (with the trailing chars attached); only a
+		# full-string regex anchor catches them. `re.match` would have accepted
+		# the valid prefix and ignored the tail.
+		self.assertFalse(validate_email_address("alice@example.com."))
+		self.assertFalse(validate_email_address("alice@example.com.."))
+		self.assertFalse(validate_email_address("alice@example.com#fragment"))
+		self.assertFalse(validate_email_address("alice@example.com\x00"))
+
+		# CRLF separator (Windows-style line endings)
+		self.assertEqual(
+			validate_email_address("test1@example.com\r\ntest2@example.com"),
+			"test1@example.com, test2@example.com",
+		)
+
+		# Throw mode rejects silently-truncated input
+		self.assertRaises(
+			frappe.InvalidEmailAddressError,
+			validate_email_address,
+			"alice@example.com)",
+			throw=True,
+		)
+
 	def test_valid_phone(self):
 		valid_phones = ["+91 1234567890", ""]
 
@@ -473,6 +811,42 @@ class TestValidationUtils(IntegrationTestCase):
 		for name in invalid_names:
 			self.assertRaises(frappe.InvalidNameError, validate_name, name, True)
 
+	def test_validate_iban(self):
+		valid_ibans = [
+			"GB82 WEST 1234 5698 7654 32",
+			"DE91 1000 0000 0123 4567 89",
+			"FR76 3000 6000 0112 3456 7890 189",
+		]
+
+		invalid_ibans = [
+			# wrong checksum (3rd place)
+			"GB72 WEST 1234 5698 7654 32",
+			"DE81 1000 0000 0123 4567 89",
+			"FR66 3000 6000 0112 3456 7890 189",
+		]
+
+		for iban in valid_ibans:
+			self.assertTrue(is_valid_iban(iban))
+
+		for not_iban in invalid_ibans:
+			self.assertFalse(is_valid_iban(not_iban))
+
+	def test_parse_json_passthrough_and_decode(self):
+		from frappe.utils.data import parse_json
+
+		# already-native values pass through untouched (the new JSON request-body path)
+		self.assertEqual(parse_json({"a": 1}), {"a": 1})
+		self.assertEqual(parse_json([1, 2]), [1, 2])
+		self.assertEqual(parse_json(None), None)
+		self.assertEqual(parse_json(1), 1)
+
+		# strings still decode (legacy form-encoded path)
+		self.assertEqual(parse_json('{"a": 1}'), {"a": 1})
+		self.assertEqual(parse_json("[1, 2]"), [1, 2])
+
+		# decoded dicts become frappe._dict (attribute access)
+		self.assertEqual(parse_json('{"a": 1}').a, 1)
+
 
 class TestImage(IntegrationTestCase):
 	def test_strip_exif_data(self):
@@ -487,6 +861,10 @@ class TestImage(IntegrationTestCase):
 
 		self.assertEqual(new_image._getexif(), None)
 		self.assertNotEqual(original_image._getexif(), new_image._getexif())
+
+		# Testing idempotency of strip_exif_data()
+		restripped_image_content = strip_exif_data(new_image_content, "image/jpeg")
+		self.assertEqual(restripped_image_content, new_image_content)
 
 	def test_optimize_image(self):
 		image_file_path = frappe.get_app_path("frappe", "tests", "data", "sample_image_for_optimization.jpg")
@@ -608,6 +986,11 @@ class TestDateUtils(IntegrationTestCase):
 		self.assertEqual(frappe.utils.is_last_day_of_the_month("2020-12-24"), False)
 		self.assertEqual(frappe.utils.is_last_day_of_the_month("2020-12-31"), True)
 
+	def test_get_timezone_utc_offset(self):
+		self.assertEqual(frappe.utils.data.get_timezone_utc_offset("UTC"), "+00:00")
+		self.assertEqual(frappe.utils.data.get_timezone_utc_offset("Asia/Kolkata"), "+05:30")
+		self.assertEqual(frappe.utils.data.get_timezone_utc_offset("Pacific/Marquesas"), "-09:30")
+
 	def test_get_time(self):
 		datetime_input = now_datetime()
 		timedelta_input = get_timedelta()
@@ -648,6 +1031,24 @@ class TestDateUtils(IntegrationTestCase):
 		self.assertEqual(duration_to_seconds("1h"), 3600)
 		self.assertEqual(duration_to_seconds("110m"), 110 * 60)
 		self.assertEqual(duration_to_seconds("110m"), 110 * 60)
+
+	def test_format_duration(self):
+		# Basic positive durations
+		self.assertEqual(format_duration(0), "")
+		self.assertEqual(format_duration(45.7), "45s")
+		self.assertEqual(format_duration(90.9), "1m 30s")
+		self.assertEqual(format_duration(3600), "1h")
+		self.assertEqual(format_duration("12885"), "3h 34m 45s")
+		self.assertEqual(format_duration(86400), "1d")
+		self.assertEqual(format_duration(86401), "1d 1s")
+
+		# Negative durations
+		self.assertEqual(format_duration(-45.3), "-45s")
+		self.assertEqual(format_duration(-12885), "-3h 34m 45s")
+
+		# hide_days parameter
+		self.assertEqual(format_duration(86400, hide_days=True), "24h")
+		self.assertEqual(format_duration(90061, hide_days=True), "25h 1m 1s")
 
 	def test_get_timespan_date_range(self):
 		supported_timespans = [
@@ -765,13 +1166,13 @@ class TestResponse(IntegrationTestCase):
 					minute=23,
 					second=23,
 					microsecond=23,
-					tzinfo=timezone.utc,
+					tzinfo=UTC,
 				),
-				time(hour=23, minute=23, second=23, microsecond=23, tzinfo=timezone.utc),
+				time(hour=23, minute=23, second=23, microsecond=23, tzinfo=UTC),
 				timedelta(days=10, hours=12, minutes=120, seconds=10),
 			],
 			"float": [
-				Decimal(29.21),
+				Decimal("29.21"),
 			],
 			"doc": [
 				frappe.get_doc("System Settings"),
@@ -824,6 +1225,107 @@ class TestXlsxUtils(IntegrationTestCase):
 		val = handle_html("<p>html data &gt;</p>")
 		self.assertIn("html data >", val)
 		self.assertEqual("abc", handle_html("abc"))
+
+	def test_formula_like_strings_are_not_written_as_formulas(self):
+		"""A leading =, +, -, @ etc must not cause the cell to be written as a real formula."""
+		from openpyxl import load_workbook
+
+		from frappe.utils.xlsxutils import make_xlsx
+
+		data = [
+			["notes", "amount", "phone"],
+			["=1+1", 1500.5, "+1-555-0100"],
+			["+91-1234567890", -5, "555-1234"],
+			["normal text", 10, "@handle-as-text"],
+		]
+		xlsx_file = make_xlsx(data, "Test Sheet")
+		wb = load_workbook(xlsx_file, data_only=False)
+		ws = wb.active
+
+		rows = list(ws.iter_rows(values_only=False))
+
+		# formula-trigger strings must be forced to string type, value unchanged
+		for coord, expected_value in (
+			((1, 0), "=1+1"),
+			((1, 2), "+1-555-0100"),
+			((2, 0), "+91-1234567890"),
+			((2, 2), "555-1234"),
+			((3, 2), "@handle-as-text"),
+		):
+			row_idx, col_idx = coord
+			cell = rows[row_idx][col_idx]
+			self.assertEqual(cell.data_type, "s")
+			self.assertEqual(cell.value, expected_value)
+
+		# real numeric values must keep their native type, not get stringified
+		self.assertEqual(rows[1][1].data_type, "n")
+		self.assertEqual(rows[1][1].value, 1500.5)
+		self.assertEqual(rows[2][1].data_type, "n")
+		self.assertEqual(rows[2][1].value, -5)
+
+
+class TestCsvUtils(IntegrationTestCase):
+	def test_escape_formula_injection_prefixes_trigger_chars(self):
+		from frappe.utils.csvutils import FORMULA_TRIGGER_CHARS, escape_formula_injection
+
+		for char in FORMULA_TRIGGER_CHARS:
+			value = f"{char}1+1"
+			self.assertEqual(escape_formula_injection(value), "'" + value)
+
+	def test_escape_formula_injection_leaves_normal_values_untouched(self):
+		from frappe.utils.csvutils import escape_formula_injection
+
+		self.assertEqual(escape_formula_injection("normal text"), "normal text")
+		self.assertEqual(escape_formula_injection("555-1234"), "555-1234")
+		self.assertEqual(escape_formula_injection(100), 100)
+		self.assertEqual(escape_formula_injection(None), None)
+
+	def test_unescape_reverses_escape(self):
+		from frappe.utils.csvutils import (
+			FORMULA_TRIGGER_CHARS,
+			escape_formula_injection,
+			unescape_formula_injection,
+		)
+
+		for char in FORMULA_TRIGGER_CHARS:
+			original = f"{char}1+1"
+			self.assertEqual(unescape_formula_injection(escape_formula_injection(original)), original)
+
+	def test_unescape_does_not_strip_literal_leading_quote(self):
+		"""A user-typed apostrophe not followed by a trigger char must survive untouched."""
+		from frappe.utils.csvutils import unescape_formula_injection
+
+		self.assertEqual(unescape_formula_injection("'hello"), "'hello")
+		self.assertEqual(unescape_formula_injection("'"), "'")
+
+	def test_to_csv_escapes_formula_like_values(self):
+		from frappe.utils.csvutils import to_csv
+
+		out = to_csv([["notes", "amount"], ["=1+1", "10"]])
+		self.assertIn("'=1+1", out)
+		self.assertNotIn('"=1+1"', out)
+
+	def test_export_reimport_round_trip_preserves_legit_data(self):
+		"""Export followed by reimport must not corrupt values that start with trigger chars."""
+		from frappe.utils.csvutils import read_csv_content, to_csv
+
+		rows = [
+			["name", "notes", "phone", "qty_text"],
+			["REC-001", "=1+1", "+1-555-0100", "-5"],
+			["REC-002", "normal text", "555-1234", "10"],
+		]
+
+		exported = to_csv(rows)
+		# a formula-like value must round-trip through escape_formula_injection
+		self.assertIn("'=1+1", exported)
+
+		reimported = read_csv_content(exported)
+		self.assertEqual(reimported, rows)
+
+		# a second export/import cycle must not accumulate extra quote markers
+		reexported = to_csv(reimported)
+		self.assertEqual(reexported, exported)
+		self.assertEqual(read_csv_content(reexported), rows)
 
 
 class TestLinkTitle(IntegrationTestCase):
@@ -916,6 +1418,29 @@ class TestLinkTitle(IntegrationTestCase):
 		user.delete()
 		prop_setter.delete()
 
+	def test_link_title_of_missing_document(self):
+		"""
+		Test that a link value with no target returns the docname without raising
+		"""
+		prop_setter = frappe.get_doc(
+			{
+				"doctype": "Property Setter",
+				"doc_type": "User",
+				"property": "show_title_field_in_link",
+				"property_type": "Check",
+				"doctype_or_field": "DocType",
+				"value": "1",
+			}
+		).insert()
+
+		from frappe.desk.search import get_link_title
+
+		frappe.clear_messages()
+		self.assertEqual(get_link_title("User", "meera.iyer@example.com"), "meera.iyer@example.com")
+		self.assertEqual(frappe.get_message_log(), [])
+
+		prop_setter.delete()
+
 
 class TestAppParser(MockedRequestTestCase):
 	def test_app_name_parser(self):
@@ -986,18 +1511,14 @@ class TestLazyLoader(IntegrationTestCase):
 
 
 class TestIdenticon(IntegrationTestCase):
-	def test_get_gravatar(self):
-		# developers@frappe.io has a gravatar linked so str URL will be returned
-		frappe.flags.in_test = False
-		gravatar_url = get_gravatar("developers@frappe.io")
-		frappe.flags.in_test = True
-		self.assertIsInstance(gravatar_url, str)
-		self.assertTrue(gravatar_url.startswith("http"))
+	def test_get_identicon(self):
+		identicon_url = get_identicon("developers@frappe.io")
+		self.assertIsInstance(identicon_url, str)
+		self.assertTrue(identicon_url.startswith("data:image/png;base64,"))
 
-		# random email will require Identicon to be generated, which will be a base64 string
-		gravatar_url = get_gravatar(f"developers{random_string(6)}@frappe.io")
-		self.assertIsInstance(gravatar_url, str)
-		self.assertTrue(gravatar_url.startswith("data:image/png;base64,"))
+		identicon_url = get_identicon(f"developers{random_string(6)}@frappe.io")
+		self.assertIsInstance(identicon_url, str)
+		self.assertTrue(identicon_url.startswith("data:image/png;base64,"))
 
 	def test_generate_identicon(self):
 		identicon = Identicon(random_string(6))
@@ -1042,7 +1563,7 @@ class TestMiscUtils(IntegrationTestCase):
 		self.assertIsInstance(get_file_timestamp(__file__), str)
 
 	def test_execute_in_shell(self):
-		err, out = execute_in_shell("ls")
+		_err, out = execute_in_shell("ls")
 		self.assertIn("apps", cstr(out))
 
 	def test_get_all_sites(self):
@@ -1056,8 +1577,8 @@ class TestMiscUtils(IntegrationTestCase):
 		self.assertGreaterEqual(len(info["users"]), 1)
 
 	def test_get_url_to_form(self):
-		self.assertTrue(get_url_to_form("System Settings").endswith("/app/system-settings"))
-		self.assertTrue(get_url_to_form("User", "Test User").endswith("/app/user/Test%20User"))
+		self.assertTrue(get_url_to_form("System Settings").endswith("/desk/system-settings"))
+		self.assertTrue(get_url_to_form("User", "Test User").endswith("/desk/user/Test%20User"))
 
 	def test_safe_json_load(self):
 		self.assertEqual(safe_json_loads("{}"), {})
@@ -1084,11 +1605,11 @@ class TestTypingValidations(IntegrationTestCase):
 	ERR_REGEX = "^Argument '.*' should be of type '.*' but got '.*' instead.$"
 
 	def test_validate_whitelisted_api(self):
-		@frappe.whitelist()
+		@validate_argument_types
 		def simple(string: str, number: int):
 			return
 
-		@frappe.whitelist()
+		@validate_argument_types
 		def varkw(string: str, **kwargs):
 			return
 
@@ -1113,175 +1634,166 @@ class TestTypingValidations(IntegrationTestCase):
 		report.toggle_disable(changed_value)
 		report.toggle_disable(current_value)
 
+	def test_forced_types(self):
+		def func(a, b=None, **kwargs):
+			pass
+
+		lax_types = frappe.whitelist(force_types=False)(func)
+		lax_types(1)  # should run without error
+
+		forced_types = frappe.whitelist(force_types=True)(func)
+		with self.assertRaises(frappe.FrappeTypeError):
+			forced_types(1)
+
+		@frappe.whitelist(force_types=True)
+		def func(a: int, b=None, **kwargs):
+			pass
+
+		with self.assertRaises(frappe.FrappeTypeError):
+			func(1)
+
+		@frappe.whitelist(force_types=True)
+		def func(a: int, b: int | None = None, **kwargs):
+			pass
+
+		func(1)  # should run without error
+
+	def test_whitelisted_http_methods_are_stored_as_tuple(self):
+		def default_methods():
+			pass
+
+		def list_methods():
+			pass
+
+		def tuple_methods():
+			pass
+
+		def string_method():
+			pass
+
+		default_methods = frappe.whitelist()(default_methods)
+		list_methods = frappe.whitelist(methods=["GET", "POST"])(list_methods)
+		tuple_methods = frappe.whitelist(methods=("PUT", "DELETE"))(tuple_methods)
+		string_method = frappe.whitelist(methods="GET")(string_method)
+
+		self.assertEqual(
+			frappe.allowed_http_methods_for_whitelisted_func[default_methods],
+			("GET", "POST", "PUT", "DELETE", "QUERY"),
+		)
+		self.assertEqual(
+			frappe.allowed_http_methods_for_whitelisted_func[list_methods], ("GET", "POST", "QUERY")
+		)
+		self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[tuple_methods], ("PUT", "DELETE"))
+		self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[string_method], ("GET", "QUERY"))
+
 
 class TestTBSanitization(IntegrationTestCase):
 	def test_traceback_sanitzation(self):
+		handle = io.BufferedWriter(io.BytesIO())
 		try:
-			password = "42"  # noqa: F841
-			args = {"password": "42", "pwd": "42", "safe": "safe_value"}
-			args = frappe._dict({"password": "42", "pwd": "42", "safe": "safe_value"})  # noqa: F841
+			password = "424242"  # noqa: F841
+			values = {"password": "424242", "pwd": "424242", "safe": "safe_value", "handle": handle}
+			args = frappe._dict(values)  # noqa: F841
 			raise Exception
 		except Exception:
 			traceback = frappe.get_traceback(with_context=True)
-			self.assertNotIn("42", traceback)
-			self.assertIn("********", traceback)
-			self.assertIn("password =", traceback)
-			self.assertIn("safe_value", traceback)
+		finally:
+			handle.close()
+
+		self.assertNotIn("424242", traceback)
+		self.assertNotIn("cannot pickle", traceback)
+		self.assertIn("********", traceback)
+		self.assertIn("password =", traceback)
+		self.assertIn("safe_value", traceback)
 
 
 class TestRounding(IntegrationTestCase):
-	@IntegrationTestCase.change_settings("System Settings", {"rounding_method": "Commercial Rounding"})
-	def test_normal_rounding(self):
+	"""`flt(value, precision, rounding_method)` supports two tie-breaking rules:
+
+	  - "Commercial Rounding": ties round away from zero  (== Decimal ROUND_HALF_UP)
+	  - "Banker's Rounding":   ties round to nearest even  (== Decimal ROUND_HALF_EVEN)
+
+	The exhaustive numeric behaviour is verified against those stdlib oracles in the
+	property tests below. The example tests only document the contrast between methods
+	and cover behaviour the oracles can't reach (string parsing, invalid input, etc.).
+	"""
+
+	def test_flt_parses_strings_and_ignores_invalid_input(self):
+		self.assertEqual(flt(None), 0)
 		self.assertEqual(flt("what"), 0)
-
-		self.assertEqual(flt("0.5", 0), 1)
 		self.assertEqual(flt("0.3"), 0.3)
+		# Thousands separators are stripped before conversion.
+		self.assertEqual(flt("1,500.5", 2), 1500.5)
 
-		self.assertEqual(flt("1.5", 0), 2)
+	def test_commercial_rounding_examples(self):
+		method = "Commercial Rounding"
+		# Ties round away from zero (contrast with banker's rounding below).
+		self.assertEqual(flt("0.5", 0, rounding_method=method), 1)
+		self.assertEqual(flt(2.5, 0, rounding_method=method), 3)
+		self.assertEqual(flt(-0.5, 0, rounding_method=method), -1)
+		# Representation-error tie that must still round up.
+		self.assertEqual(flt(2.675, 2, rounding_method=method), 2.68)
 
-		# positive rounding to integers
-		self.assertEqual(flt(0.4, 0), 0)
-		self.assertEqual(flt(0.5, 0), 1)
-		self.assertEqual(flt(1.455, 0), 1)
-		self.assertEqual(flt(1.5, 0), 2)
+	def test_bankers_rounding_examples(self):
+		method = "Banker's Rounding"
+		self.assertEqual(rounded(0, 0, rounding_method=method), 0)
+		self.assertEqual(rounded(5.551115123125783e-17, 2, rounding_method=method), 0.0)
+		# Ties round to the nearest even digit (contrast with commercial rounding above).
+		self.assertEqual(flt("0.5", 0, rounding_method=method), 0)
+		self.assertEqual(flt(2.5, 0, rounding_method=method), 2)
+		self.assertEqual(flt(-0.5, 0, rounding_method=method), 0)
+		self.assertEqual(flt(2.675, 2, rounding_method=method), 2.68)
 
-		# negative rounding to integers
-		self.assertEqual(flt(-0.5, 0), -1)
-		self.assertEqual(flt(-1.5, 0), -2)
+	def test_rounding_does_not_inflate_exactly_representable_values(self):
+		self.assertEqual(flt(9750000.0, 9, rounding_method="Commercial Rounding"), 9750000.0)
+		self.assertEqual(flt(6500000.0, 9, rounding_method="Commercial Rounding"), 6500000.0)
+		self.assertEqual(flt(26509905246072.0, 2, rounding_method="Commercial Rounding"), 26509905246072.0)
+		self.assertEqual(flt(26509905246072.01, 2, rounding_method="Banker's Rounding"), 26509905246072.01)
 
-		# negative precision i.e. round to nearest 10th
-		self.assertEqual(flt(123, -1), 120)
-		self.assertEqual(flt(125, -1), 130)
-		self.assertEqual(flt(134.45, -1), 130)
-		self.assertEqual(flt(135, -1), 140)
+	def test_commercial_rounding_breaks_representable_ties_away_from_zero(self):
+		# Past 2**50 floats are spaced 0.25 apart, so a .5 tie is exactly representable.
+		method = "Commercial Rounding"
+		self.assertEqual(flt(2**50 + 0.5, 0, rounding_method=method), 2**50 + 1)
+		self.assertEqual(flt(-(2**50) - 0.5, 0, rounding_method=method), -(2**50) - 1)
 
-		# positive multiple digit rounding
-		self.assertEqual(flt(1.25, 1), 1.3)
-		self.assertEqual(flt(0.15, 1), 0.2)
-
-		# negative multiple digit rounding
-		self.assertEqual(flt(-1.25, 1), -1.3)
-		self.assertEqual(flt(-0.15, 1), -0.2)
-
-	def test_normal_rounding_as_argument(self):
-		rounding_method = "Commercial Rounding"
-
-		self.assertEqual(flt("0.5", 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt("0.3", rounding_method=rounding_method), 0.3)
-
-		self.assertEqual(flt("1.5", 0, rounding_method=rounding_method), 2)
-
-		# positive rounding to integers
-		self.assertEqual(flt(0.4, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.455, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-
-		# negative rounding to integers
-		self.assertEqual(flt(-0.5, 0, rounding_method=rounding_method), -1)
-		self.assertEqual(flt(-1.5, 0, rounding_method=rounding_method), -2)
-
-		# negative precision i.e. round to nearest 10th
-		self.assertEqual(flt(123, -1, rounding_method=rounding_method), 120)
-		self.assertEqual(flt(125, -1, rounding_method=rounding_method), 130)
-		self.assertEqual(flt(134.45, -1, rounding_method=rounding_method), 130)
-		self.assertEqual(flt(135, -1, rounding_method=rounding_method), 140)
-
-		# positive multiple digit rounding
-		self.assertEqual(flt(1.25, 1, rounding_method=rounding_method), 1.3)
-		self.assertEqual(flt(0.15, 1, rounding_method=rounding_method), 0.2)
-		self.assertEqual(flt(2.675, 2, rounding_method=rounding_method), 2.68)
-
-		# negative multiple digit rounding
-		self.assertEqual(flt(-1.25, 1, rounding_method=rounding_method), -1.3)
-		self.assertEqual(flt(-0.15, 1, rounding_method=rounding_method), -0.2)
-
-		# Nearest number and not even (the default behaviour)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-		self.assertEqual(flt(2.5, 0, rounding_method=rounding_method), 3)
-		self.assertEqual(flt(3.5, 0, rounding_method=rounding_method), 4)
-
-		self.assertEqual(flt(0.05, 1, rounding_method=rounding_method), 0.1)
-		self.assertEqual(flt(1.15, 1, rounding_method=rounding_method), 1.2)
-		self.assertEqual(flt(2.25, 1, rounding_method=rounding_method), 2.3)
-		self.assertEqual(flt(3.35, 1, rounding_method=rounding_method), 3.4)
+	@given(
+		st.sampled_from(["Commercial Rounding", "Banker's Rounding"]),
+		st.floats(min_value=-1e14, max_value=1e14, allow_nan=False, allow_infinity=False),
+		st.integers(min_value=0, max_value=9),
+	)
+	def test_rounding_is_idempotent(self, rounding_method, number, precision):
+		rounded_once = flt(number, precision, rounding_method=rounding_method)
+		self.assertEqual(flt(rounded_once, precision, rounding_method=rounding_method), rounded_once)
 
 	@IntegrationTestCase.change_settings("System Settings", {"rounding_method": "Commercial Rounding"})
 	@given(
 		st.decimals(min_value=-1e8, max_value=1e8),
 		st.integers(min_value=-2, max_value=4),
 	)
-	def test_normal_rounding_property(self, number, precision):
+	def test_commercial_rounding_matches_round_half_up(self, number, precision):
 		with localcontext() as ctx:
 			ctx.rounding = ROUND_HALF_UP
 			self.assertEqual(Decimal(str(flt(float(number), precision))), round(number, precision))
-
-	def test_bankers_rounding(self):
-		rounding_method = "Banker's Rounding"
-
-		self.assertEqual(rounded(0, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(rounded(5.551115123125783e-17, 2, rounding_method=rounding_method), 0.0)
-
-		self.assertEqual(flt("0.5", 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt("0.3", rounding_method=rounding_method), 0.3)
-
-		self.assertEqual(flt("1.5", 0, rounding_method=rounding_method), 2)
-
-		# positive rounding to integers
-		self.assertEqual(flt(0.4, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(1.455, 0, rounding_method=rounding_method), 1)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-
-		# negative rounding to integers
-		self.assertEqual(flt(-0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(-1.5, 0, rounding_method=rounding_method), -2)
-
-		# negative precision i.e. round to nearest 10th
-		self.assertEqual(flt(123, -1, rounding_method=rounding_method), 120)
-		self.assertEqual(flt(125, -1, rounding_method=rounding_method), 120)
-		self.assertEqual(flt(134.45, -1, rounding_method=rounding_method), 130)
-		self.assertEqual(flt(135, -1, rounding_method=rounding_method), 140)
-
-		# positive multiple digit rounding
-		self.assertEqual(flt(1.25, 1, rounding_method=rounding_method), 1.2)
-		self.assertEqual(flt(0.15, 1, rounding_method=rounding_method), 0.2)
-		self.assertEqual(flt(2.675, 2, rounding_method=rounding_method), 2.68)
-		self.assertEqual(flt(-2.675, 2, rounding_method=rounding_method), -2.68)
-
-		# negative multiple digit rounding
-		self.assertEqual(flt(-1.25, 1, rounding_method=rounding_method), -1.2)
-		self.assertEqual(flt(-0.15, 1, rounding_method=rounding_method), -0.2)
-
-		# Nearest number and not even (the default behaviour)
-		self.assertEqual(flt(0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(1.5, 0, rounding_method=rounding_method), 2)
-		self.assertEqual(flt(2.5, 0, rounding_method=rounding_method), 2)
-		self.assertEqual(flt(3.5, 0, rounding_method=rounding_method), 4)
-
-		self.assertEqual(flt(0.05, 1, rounding_method=rounding_method), 0.0)
-		self.assertEqual(flt(1.15, 1, rounding_method=rounding_method), 1.2)
-		self.assertEqual(flt(2.25, 1, rounding_method=rounding_method), 2.2)
-		self.assertEqual(flt(3.35, 1, rounding_method=rounding_method), 3.4)
-
-		self.assertEqual(flt(-0.5, 0, rounding_method=rounding_method), 0)
-		self.assertEqual(flt(-1.5, 0, rounding_method=rounding_method), -2)
-		self.assertEqual(flt(-2.5, 0, rounding_method=rounding_method), -2)
-		self.assertEqual(flt(-3.5, 0, rounding_method=rounding_method), -4)
-
-		self.assertEqual(flt(-0.05, 1, rounding_method=rounding_method), 0.0)
-		self.assertEqual(flt(-1.15, 1, rounding_method=rounding_method), -1.2)
-		self.assertEqual(flt(-2.25, 1, rounding_method=rounding_method), -2.2)
-		self.assertEqual(flt(-3.35, 1, rounding_method=rounding_method), -3.4)
 
 	@IntegrationTestCase.change_settings("System Settings", {"rounding_method": "Banker's Rounding"})
 	@given(
 		st.decimals(min_value=-1e8, max_value=1e8),
 		st.integers(min_value=-2, max_value=4),
 	)
-	def test_bankers_rounding_property(self, number, precision):
+	def test_bankers_rounding_matches_round_half_even(self, number, precision):
 		self.assertEqual(Decimal(str(flt(float(number), precision))), round(number, precision))
+
+	@given(
+		st.sampled_from(["Commercial Rounding", "Banker's Rounding"]),
+		st.floats(min_value=-1e8, max_value=1e8, allow_nan=False, allow_infinity=False),
+		st.integers(min_value=-2, max_value=4),
+	)
+	def test_rounding_is_sign_symmetric(self, rounding_method, number, precision):
+		# Regression: rounding a negated value must equal negating the rounded value.
+		self.assertEqual(
+			flt(-number, precision, rounding_method=rounding_method),
+			-flt(number, precision, rounding_method=rounding_method),
+		)
 
 	def test_default_rounding(self):
 		self.assertEqual(frappe.get_system_settings("rounding_method"), "Banker's Rounding")
@@ -1301,10 +1813,6 @@ class TestArgumentTypingValidations(IntegrationTestCase):
 		from unittest.mock import AsyncMock, MagicMock, Mock
 
 		from frappe.core.doctype.doctype.doctype import DocType
-		from frappe.utils.typing_validations import (
-			FrappeTypeError,
-			validate_argument_types,
-		)
 
 		@validate_argument_types
 		def test_simple_types(a: int, b: float, c: bool):
@@ -1437,3 +1945,57 @@ class TestURLTrackers(IntegrationTestCase):
 		self.assertDocumentEqual(result["utm_medium"], expected["utm_medium"])
 		self.assertDocumentEqual(result["utm_campaign"], expected["utm_campaign"])
 		self.assertEqual(result["utm_content"], expected["utm_content"])
+
+
+class TestDataUtils(UnitTestCase):
+	def setUp(self):
+		frappe.local.lang = "en"
+
+	def tearDown(self):
+		frappe.local.lang = "en"
+
+	def test_orjson_dumps_fallback_on_large_integers(self):
+		def normalize(v):
+			return json.loads(v)
+
+		big = 2**63 + 1
+		result = orjson_dumps({"big": big})
+		self.assertEqual(normalize(result), normalize(json.dumps({"big": big})))
+
+		result_bytes = orjson_dumps({"big": big}, decode=False)
+		self.assertIsInstance(result_bytes, bytes)
+		self.assertEqual(normalize(result_bytes), normalize(json.dumps({"big": big}).encode()))
+
+	def test_comma_and(self):
+		self.assertEqual(comma_and(["a", "b", "c"]), "'a', 'b', and 'c'")
+		self.assertEqual(comma_and(["a", "b", "c"], add_quotes=False), "a, b, and c")
+
+		frappe.local.lang = "pt-BR"
+
+		self.assertEqual(comma_and(["a", "b", "c"]), "'a', 'b' e 'c'")
+		self.assertEqual(comma_and(["a", "b", "c"], add_quotes=False), "a, b e c")
+
+	def test_comma_or(self):
+		self.assertEqual(comma_or(["a", "b", "c"]), "'a', 'b', or 'c'")
+		self.assertEqual(comma_or(["a", "b", "c"], add_quotes=False), "a, b, or c")
+
+		frappe.local.lang = "pt-BR"
+
+		self.assertEqual(comma_or(["a", "b", "c"]), "'a', 'b' ou 'c'")
+		self.assertEqual(comma_or(["a", "b", "c"], add_quotes=False), "a, b ou c")
+
+
+class TestMsgPrint(UnitTestCase):
+	def tearDown(self) -> None:
+		super().tearDown()
+		frappe.clear_messages()
+
+	def test_msgprint(self):
+		frappe.msgprint("Validate: <script>alert('bounty')</script>")
+		message = frappe.get_message_log()[-1]
+
+		self.assertNotIn("script", message.message)
+
+		frappe.msgprint("<ul><li>abc<li></ul>")
+		message = frappe.get_message_log()[-1]
+		self.assertIn("<ul><li>", message.message)

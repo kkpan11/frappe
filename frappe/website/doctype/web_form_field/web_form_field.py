@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class WebFormField(Document):
+	_DOCTYPE_NAME = "Web Form Field"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -56,6 +58,7 @@ class WebFormField(Document):
 		parent: DF.Data
 		parentfield: DF.Data
 		parenttype: DF.Data
+		placeholder: DF.Data | None
 		precision: DF.Literal["", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
 		read_only: DF.Check
 		read_only_depends_on: DF.Code | None

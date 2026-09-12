@@ -7,15 +7,18 @@ from contextlib import suppress
 from typing import Any
 
 from rq import get_current_job
+from rq.command import send_stop_job_command
+from rq.exceptions import InvalidJobOperation
 
 import frappe
+from frappe import _
 from frappe.database.utils import dangerously_reconnect_on_connection_abort
 from frappe.desk.form.load import get_attachments
-from frappe.desk.query_report import generate_report_result
+from frappe.desk.query_report import generate_report_result, get_reference_report
 from frappe.model.document import Document
 from frappe.monitor import add_data_to_monitor
 from frappe.utils import add_to_date, now
-from frappe.utils.background_jobs import enqueue
+from frappe.utils.background_jobs import enqueue, get_redis_conn
 
 # If prepared report runs for longer than this time it's automatically considered as failed
 FAILURE_THRESHOLD = 6 * 60 * 60
@@ -23,6 +26,8 @@ REPORT_TIMEOUT = 25 * 60
 
 
 class PreparedReport(Document):
+	_DOCTYPE_NAME = "Prepared Report"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -80,16 +85,37 @@ class PreparedReport(Document):
 			prepared_report=self.name,
 			timeout=timeout or REPORT_TIMEOUT,
 			enqueue_after_commit=True,
+			at_front_when_starved=True,
 		)
 
-	def get_prepared_data(self, with_file_name=False):
-		if attachments := get_attachments(self.doctype, self.name):
-			attachment = attachments[0]
-			attached_file = frappe.get_doc("File", attachment.name)
+	def get_prepared_data(self, with_file_name=False, format="json"):
+		attachments = get_attachments(self.doctype, self.name)
+		if not attachments:
+			frappe.throw(_("No attachment found for the prepared report"), title=_("Attachment Not Found"))
 
-			if with_file_name:
-				return (gzip.decompress(attached_file.get_content()), attachment.file_name)
-			return gzip.decompress(attached_file.get_content())
+		attachment = None
+		is_format_json = format == "json"
+
+		def check_attachment_condition(f, is_format_json=is_format_json):
+			if is_format_json:
+				return f.file_name.endswith(".gz")
+			return f.file_name.startswith("csv_") and f.file_name.endswith(".csv")
+
+		for f in attachments or []:
+			if check_attachment_condition(f, is_format_json):
+				attachment = f
+				break
+
+		attached_file = frappe.get_doc("File", attachment.name)
+		file_to_send = None
+		if is_format_json:
+			file_to_send = gzip.decompress(attached_file.get_content())
+		else:
+			file_to_send = attached_file.get_content()
+
+		if with_file_name:
+			return (file_to_send, attachment.file_name)
+		return file_to_send
 
 
 def generate_report(prepared_report):
@@ -105,21 +131,42 @@ def generate_report(prepared_report):
 
 		if report.report_type == "Custom Report":
 			custom_report_doc = report
-			reference_report = custom_report_doc.reference_report
-			report = frappe.get_doc("Report", reference_report)
+			report = get_reference_report(custom_report_doc)
+			report.custom_report = instance.report_name
+			report.prepared_report = custom_report_doc.prepared_report
+			report.disable_prepared_report_automation = custom_report_doc.disable_prepared_report_automation
 			if custom_report_doc.json:
 				data = json.loads(custom_report_doc.json)
 				if data:
 					report.custom_columns = data["columns"]
 
 		result = generate_report_result(report=report, filters=instance.filters, user=instance.owner)
+
 		create_json_gz_file(result, instance.doctype, instance.name, instance.report_name)
 
+		if report.generate_csv:
+			_enqueue_json_to_csv_conversion(prepared_report)
+
 		instance.status = "Completed"
+
+		frappe.get_doc(
+			{
+				"doctype": "Notification Log",
+				"subject": f"{instance.report_name} report is ready.",
+				"for_user": frappe.session.user,
+				"document_type": "Report",
+				"document_name": report.name,
+				"link": f"/desk/query-report/{report.name}?prepared_report_name={instance.name}",
+			}
+		).insert(ignore_permissions=True)
+
 	except Exception:
 		# we need to ensure that error gets stored
 		_save_error(instance, error=frappe.get_traceback(with_context=True))
+		return
 
+	instance.reload()
+	instance.status = "Completed"
 	instance.report_end_time = frappe.utils.now()
 	instance.peak_memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 	add_data_to_monitor(peak_memory_usage=instance.peak_memory_usage)
@@ -156,8 +203,11 @@ def update_job_id(prepared_report):
 
 
 @frappe.whitelist()
-def make_prepared_report(report_name, filters=None):
+def make_prepared_report(report_name: str, filters: dict[str, Any] | str | list | None = None):
 	"""run reports in background"""
+	from frappe.desk.query_report import get_report_doc
+
+	get_report_doc(report_name)
 	prepared_report = frappe.get_doc(
 		{
 			"doctype": "Prepared Report",
@@ -167,6 +217,28 @@ def make_prepared_report(report_name, filters=None):
 	).insert(ignore_permissions=True)
 
 	return {"name": prepared_report.name}
+
+
+@frappe.whitelist()
+def stop_prepared_report(report_name: str):
+	"""Stop a running Prepared Report job."""
+	prepared_report = frappe.get_doc("Prepared Report", report_name)
+	prepared_report.check_permission("write")
+
+	job_id = prepared_report.job_id
+	if not job_id.startswith(frappe.local.site):
+		frappe.throw(f"Invalid job_id: must start with {frappe.local.site}")
+
+	try:
+		send_stop_job_command(connection=get_redis_conn(), job_id=job_id)
+		frappe.db.set_value(
+			"Prepared Report",
+			prepared_report.name,
+			{"status": "Cancelled"},
+		)
+		frappe.msgprint(_("Job stopped successfully"), alert=True, indicator="green")
+	except InvalidJobOperation:
+		frappe.msgprint(_("Job is not running."), title=_("Invalid Operation"))
 
 
 def process_filters_for_prepared_report(filters: dict[str, Any] | str) -> str:
@@ -181,7 +253,7 @@ def process_filters_for_prepared_report(filters: dict[str, Any] | str) -> str:
 
 
 @frappe.whitelist()
-def get_reports_in_queued_state(report_name, filters):
+def get_reports_in_queued_state(report_name: str, filters: dict[str, Any] | str | list):
 	return frappe.get_all(
 		"Prepared Report",
 		filters={
@@ -221,7 +293,7 @@ def expire_stalled_report():
 
 
 @frappe.whitelist()
-def delete_prepared_reports(reports):
+def delete_prepared_reports(reports: str | list[dict[str, Any]]):
 	reports = frappe.parse_json(reports)
 	for report in reports:
 		prepared_report = frappe.get_doc("Prepared Report", report["name"])
@@ -236,7 +308,7 @@ def create_json_gz_file(data, dt, dn, report_name):
 		frappe.scrub(report_name), frappe.utils.data.format_datetime(frappe.utils.now(), "Y-m-d-H-M")
 	)
 	encoded_content = frappe.safe_encode(frappe.as_json(data, indent=None, separators=(",", ":")))
-	compressed_content = gzip.compress(encoded_content)
+	compressed_content = gzip.compress(encoded_content, compresslevel=5)
 
 	# Call save() file function to upload and attach the file
 	_file = frappe.get_doc(
@@ -253,12 +325,12 @@ def create_json_gz_file(data, dt, dn, report_name):
 
 
 @frappe.whitelist()
-def download_attachment(dn):
+def download_attachment(dn: str, format: str):
 	pr = frappe.get_doc("Prepared Report", dn)
 	if not pr.has_permission("read"):
 		frappe.throw(frappe._("Cannot Download Report due to insufficient permissions"))
 
-	data, file_name = pr.get_prepared_data(with_file_name=True)
+	data, file_name = pr.get_prepared_data(with_file_name=True, format=format)
 	frappe.local.response.filename = file_name[:-3]
 	frappe.local.response.filecontent = data
 	frappe.local.response.type = "binary"
@@ -272,14 +344,17 @@ def get_permission_query_condition(user):
 
 	from frappe.utils.user import UserPermissions
 
-	user = UserPermissions(user)
+	user_perms = UserPermissions(user)
 
-	if "System Manager" in user.roles:
+	if "System Manager" in user_perms.roles:
 		return None
 
-	reports = [frappe.db.escape(report) for report in user.get_all_reports().keys()]
+	reports = [frappe.db.escape(report) for report in user_perms.get_all_reports().keys()]
 
-	return """`tabPrepared Report`.report_name in ({reports})""".format(reports=",".join(reports))
+	reports = ",".join(reports)
+	owner = frappe.db.escape(user)
+
+	return f"""`tabPrepared Report`.report_name in ({reports}) and `tabPrepared Report`.owner = {owner}"""
 
 
 def has_permission(doc, user):
@@ -296,3 +371,74 @@ def has_permission(doc, user):
 		return True
 
 	return doc.report_name in user.get_all_reports().keys()
+
+
+@frappe.whitelist()
+def enqueue_json_to_csv_conversion(prepared_report_name: str):
+	"""Call this to enqueue the conversion in background."""
+	frappe.get_doc("Prepared Report", prepared_report_name).check_permission("read")
+	_enqueue_json_to_csv_conversion(prepared_report_name)
+
+
+def _enqueue_json_to_csv_conversion(prepared_report_name: str):
+	enqueue(method=convert_json_to_csv, queue="long", prepared_report_name=prepared_report_name)
+
+
+def convert_json_to_csv(prepared_report_name):
+	"""Background job: Fetch JSON file, convert to CSV, attach CSV to Prepared Report."""
+
+	import csv
+	from io import StringIO
+
+	doc = frappe.get_doc("Prepared Report", prepared_report_name)
+	json_content, file_name = doc.get_prepared_data(with_file_name=True)
+
+	if not json_content:
+		frappe.log_error(f"No JSON content found for {prepared_report_name}", "CSV Conversion")
+		return
+
+	parsed = json.loads(json_content)
+
+	columns = parsed.get("columns", [])
+	result = parsed.get("result", [])
+
+	if not columns or not result:
+		frappe.log_error("Columns or result is empty", "CSV Conversion")
+		return
+
+	fieldnames = [col.get("fieldname") for col in columns if col.get("fieldname")]
+
+	output = StringIO()
+	writer = csv.DictWriter(output, fieldnames=fieldnames)
+	writer.writeheader()
+	for row in result:
+		if isinstance(row, dict):
+			writer.writerow({key: row.get(key, "") for key in fieldnames})
+		else:
+			writer.writerow({field: row[idx] for idx, field in enumerate(fieldnames)})
+
+	csv_content = output.getvalue().encode("utf-8")
+
+	_file = frappe.get_doc(
+		{
+			"doctype": "File",
+			"file_name": f"csv_{file_name[:-8]}.csv",
+			"attached_to_doctype": "Prepared Report",
+			"attached_to_name": prepared_report_name,
+			"content": csv_content,
+			"is_private": 1,
+		}
+	)
+	_file.save(ignore_permissions=True)
+
+	frappe.get_doc(
+		{
+			"doctype": "Notification Log",
+			"subject": "Your CSV file is ready for download",
+			"email_content": f'Click <a href="{_file.file_url}" target="_blank">here</a> to download the file.',
+			"for_user": frappe.session.user,
+			"document_type": "File",
+			"document_name": _file.name,
+			"link": _file.file_url,
+		}
+	).insert(ignore_permissions=True)

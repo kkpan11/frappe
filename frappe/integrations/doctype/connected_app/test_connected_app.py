@@ -1,5 +1,6 @@
 # Copyright (c) 2019, Frappe Technologies and contributors
 # License: MIT. See LICENSE
+from unittest.mock import patch
 from urllib.parse import urljoin
 
 import requests
@@ -8,7 +9,9 @@ import frappe
 from frappe.integrations.doctype.social_login_key.test_social_login_key import (
 	create_or_update_social_login_key,
 )
-from frappe.tests import IntegrationTestCase, UnitTestCase
+from frappe.integrations.doctype.token_cache.token_cache import TokenCache
+from frappe.tests import IntegrationTestCase
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 
 
 def get_user(usr, pwd):
@@ -43,20 +46,13 @@ def get_oauth_client():
 	oauth_client.grant_type = "Authorization Code"
 	oauth_client.response_type = "Code"
 	oauth_client.skip_authorization = 1
+	oauth_client.token_endpoint_auth_method = "Client Secret Post"
 	oauth_client.insert()
 
 	return oauth_client
 
 
-class UnitTestConnectedApp(UnitTestCase):
-	"""
-	Unit tests for ConnectedApp.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
-
-
+@requires_test_service(TestService.WEB_SERVER)
 class TestConnectedApp(IntegrationTestCase):
 	def setUp(self):
 		"""Set up a Connected App that connects to our own oAuth provider.
@@ -101,18 +97,14 @@ class TestConnectedApp(IntegrationTestCase):
 		self.connected_app.reload()
 		self.oauth_client.reload()
 
-	def test_web_application_flow(self):
-		"""Simulate a logged in user who opens the authorization URL."""
-
-		def login():
-			return session.get(
-				urljoin(self.base_url, "/api/method/login"),
-				params={"usr": self.user_name, "pwd": self.user_password},
-			)
-
+	def complete_web_application_flow(self):
+		"""Simulate a logged in user who opens the authorization URL and store the token."""
 		session = requests.Session()
 
-		first_login = login()
+		first_login = session.get(
+			urljoin(self.base_url, "/api/method/login"),
+			params={"usr": self.user_name, "pwd": self.user_password},
+		)
 		self.assertEqual(first_login.status_code, 200)
 
 		authorization_url = self.connected_app.initiate_web_application_flow(user=self.user_name)
@@ -124,6 +116,12 @@ class TestConnectedApp(IntegrationTestCase):
 		self.assertEqual(callback_response.status_code, 200)
 
 		self.token_cache = self.connected_app.get_token_cache(self.user_name)
+		return session
+
+	def test_web_application_flow(self):
+		"""Simulate a logged in user who opens the authorization URL."""
+		self.complete_web_application_flow()
+
 		token = self.token_cache.get_password("access_token")
 		self.assertNotEqual(token, None)
 
@@ -131,11 +129,38 @@ class TestConnectedApp(IntegrationTestCase):
 		resp = oauth2_session.get(urljoin(self.base_url, "/api/method/frappe.auth.get_logged_user"))
 		self.assertEqual(resp.json().get("message"), self.user_name)
 
+	def test_concurrent_refresh_skips_redundant_call(self):
+		"""A refresh must be skipped if another worker already refreshed the token."""
+		self.complete_web_application_flow()
+
+		self.token_cache.db_set("expires_in", -1)
+
+		# Stand in for a concurrent worker that refreshed first: the reload under the lock
+		# returns a token that is no longer expired.
+		original_reload = TokenCache.reload
+
+		def reload_as_fresh(token_cache, *args, **kwargs):
+			original_reload(token_cache, *args, **kwargs)
+			token_cache.expires_in = 3600
+			return token_cache
+
+		with (
+			patch.object(
+				self.connected_app, "get_oauth2_session", wraps=self.connected_app.get_oauth2_session
+			) as session_spy,
+			patch.object(TokenCache, "reload", reload_as_fresh),
+		):
+			self.connected_app.get_active_token(self.user_name)
+
+		session_spy.assert_not_called()
+
 	def tearDown(self):
 		def delete_if_exists(attribute):
 			doc = getattr(self, attribute, None)
 			if doc:
 				doc.delete(force=True)
+
+		frappe.db.commit()  # Avoid snapshot violation issues
 
 		delete_if_exists("token_cache")
 		delete_if_exists("connected_app")
@@ -150,6 +175,8 @@ class TestConnectedApp(IntegrationTestCase):
 			for code in codes:
 				doc = frappe.get_doc("OAuth Authorization Code", code.name)
 				doc.delete()
+
+		frappe.db.commit()
 
 		delete_if_exists("user")
 		delete_if_exists("oauth_client")

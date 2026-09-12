@@ -20,10 +20,9 @@ import os
 import typing
 from datetime import datetime
 
-import click
-
 import frappe
-from frappe import _, _lt
+from frappe import N_, _
+from frappe.app_state import is_disabled_app_filtering_active, is_module_disabled
 from frappe.model import (
 	NO_VALUE_FIELDS,
 	child_table_fields,
@@ -38,24 +37,28 @@ from frappe.model.base_document import (
 	BaseDocument,
 )
 from frappe.model.document import Document
+from frappe.model.utils import is_single_doctype
 from frappe.model.workflow import get_workflow_name
 from frappe.modules import load_doctype_module
-from frappe.types import DocRef
 from frappe.utils import cached_property, cast, cint, cstr
-from frappe.utils.data import add_to_date, get_datetime
+from frappe.utils.caching import site_cache
+from frappe.utils.data import add_to_date, get_currency_precision, get_datetime
+
+ListOrTuple = list | tuple
+SerializableTypes = str | int | float | datetime
 
 DEFAULT_FIELD_LABELS = {
-	"name": _lt("ID"),
-	"creation": _lt("Created On"),
-	"docstatus": _lt("Document Status"),
-	"idx": _lt("Index"),
-	"modified": _lt("Last Updated On"),
-	"modified_by": _lt("Last Updated By"),
-	"owner": _lt("Created By"),
-	"_user_tags": _lt("Tags"),
-	"_liked_by": _lt("Liked By"),
-	"_comments": _lt("Comments"),
-	"_assign": _lt("Assigned To"),
+	"name": N_("ID"),
+	"creation": N_("Created On"),
+	"docstatus": N_("Document Status"),
+	"idx": N_("Index"),
+	"modified": N_("Last Updated On"),
+	"modified_by": N_("Last Updated By"),
+	"owner": N_("Created By"),
+	"_user_tags": N_("Tags"),
+	"_liked_by": N_("Liked By"),
+	"_comments": N_("Comments"),
+	"_assign": N_("Assigned To"),
 }
 
 # When number of rows in a table exceeds this number, we disable certain features automatically.
@@ -83,6 +86,7 @@ def get_meta(doctype: "str | DocType", cached: bool = True) -> "_Meta":
 		return meta
 
 	meta = Meta(doctype)
+
 	key = f"doctype_meta::{meta.name}"
 	frappe.client_cache.set_value(key, meta)
 	return meta
@@ -162,6 +166,8 @@ class Meta(Document):
 		# don't process for special doctypes
 		# prevents circular dependency
 		if self.name in self.special_doctypes:
+			if self.name == "DocPerm":
+				self.add_custom_fields()
 			self.init_field_caches()
 			return
 
@@ -175,31 +181,7 @@ class Meta(Document):
 		self.check_if_large_table()
 
 	def as_dict(self, no_nulls=False):
-		def serialize(doc):
-			if isinstance(doc, dict):
-				return doc.copy()
-			out = {}
-			for key, value in doc.__dict__.items():
-				if isinstance(value, list | tuple):
-					if not value or not isinstance(value[0], BaseDocument):
-						# non standard list object, skip
-						continue
-
-					value = [serialize(d) for d in value]
-
-				if (not no_nulls and value is None) or isinstance(
-					value, str | int | float | datetime | list | tuple
-				):
-					out[key] = value
-
-			# set empty lists for unset table fields
-			for fieldname in TABLE_DOCTYPES_FOR_DOCTYPE.keys():
-				if out.get(fieldname) is None:
-					out[fieldname] = []
-
-			return out
-
-		return serialize(self)
+		return _serialize(self, no_nulls=no_nulls)
 
 	def get_link_fields(self):
 		return self.get("fields", {"fieldtype": "Link", "options": ["!=", "[Select]"]})
@@ -212,6 +194,27 @@ class Meta(Document):
 
 	def get_dynamic_link_fields(self):
 		return self._dynamic_link_fields
+
+	def get_masked_fields(self, parenttype=None):
+		import copy
+
+		if frappe.session.user == "Administrator":
+			return []
+		cache_key = f"masked_fields::{self.name}::{parenttype or ''}::{frappe.session.user}"
+		masked_fields = frappe.cache.get_value(cache_key)
+
+		if masked_fields is None:
+			masked_fields = []
+			permlevel_access = set(self.get_permlevel_access("mask", parenttype))
+			for df in self.fields:
+				if df.get("mask") and df.permlevel not in permlevel_access:
+					# work on a copy instead of original df
+					df_copy = copy.deepcopy(df)
+					df_copy.mask_readonly = 1
+					masked_fields.append(df_copy)
+			frappe.cache.set_value(cache_key, masked_fields)
+
+		return masked_fields
 
 	@cached_property
 	def _dynamic_link_fields(self):
@@ -241,8 +244,8 @@ class Meta(Document):
 
 		return set_only_once_fields
 
-	def get_table_fields(self):
-		return self._table_fields
+	def get_table_fields(self, include_computed=False):
+		return self._table_fields if include_computed else self._non_computed_table_fields
 
 	def get_global_search_fields(self):
 		"""Return list of fields with `in_global_search` set and `name` if set."""
@@ -298,14 +301,18 @@ class Meta(Document):
 		return fieldname in self._fields
 
 	def get_label(self, fieldname):
-		"""Return label of the given fieldname."""
+		"""Return the untranslated source label of the given fieldname."""
 		if df := self.get_field(fieldname):
 			return df.get("label")
 
 		if fieldname in DEFAULT_FIELD_LABELS:
-			return str(DEFAULT_FIELD_LABELS[fieldname])
+			return DEFAULT_FIELD_LABELS[fieldname]
 
 		return "No Label"
+
+	def get_translated_label(self, fieldname):
+		"""Return the translated label of the given fieldname."""
+		return _(self.get_label(fieldname), context=self.name)
 
 	def get_options(self, fieldname):
 		return self.get_field(fieldname).options
@@ -325,6 +332,7 @@ class Meta(Document):
 		if "name" not in search_fields:
 			search_fields.append("name")
 
+		assert "name" in search_fields, "search fields must always include 'name'"
 		return search_fields
 
 	def get_fields_to_fetch(self, link_fieldname=None):
@@ -372,6 +380,7 @@ class Meta(Document):
 		if not title_field:
 			title_field = "name"
 
+		assert title_field, "title field must resolve to a non-empty fieldname"
 		return title_field
 
 	def get_translatable_fields(self):
@@ -412,14 +421,11 @@ class Meta(Document):
 		if not custom_fields:
 			return
 
+		custom_fields = [field for field in custom_fields if not is_field_hidden_by_app(field)]
+
 		self.extend("fields", custom_fields)
 
 	def apply_property_setters(self):
-		"""
-		Property Setters are set via Customize Form. They override standard properties
-		of the doctype or its child properties like fields, links etc. This method
-		applies the customized properties over the standard meta object
-		"""
 		if not frappe.db.table_exists("Property Setter"):
 			return
 
@@ -432,6 +438,13 @@ class Meta(Document):
 
 		if not property_setters:
 			return
+
+		hide_disabled = is_disabled_app_filtering_active()
+		property_setters = [
+			ps
+			for ps in property_setters
+			if not ((hide_disabled and ps.get("is_app_disabled")) or is_module_disabled(ps.module))
+		]
 
 		for ps in property_setters:
 			if ps.doctype_or_field == "DocType":
@@ -498,22 +511,51 @@ class Meta(Document):
 			return
 
 		if frappe.db.estimate_count(self.name) > LARGE_TABLE_SIZE_THRESHOLD:
-			recent_change = frappe.db.get_value(self.name, {}, "creation", order_by="creation desc")
-			if get_datetime(recent_change) > add_to_date(None, days=-1 * LARGE_TABLE_RECENCY_THRESHOLD):
+			# Raw SQL to prevent querying meta when already in meta
+			recent_change = frappe.db.sql(
+				f"SELECT `creation` FROM `tab{self.name}` ORDER BY `creation` DESC LIMIT 1"
+			)  # nosemgrep
+			if recent_change and get_datetime(recent_change[0][0]) > add_to_date(
+				None, days=-1 * LARGE_TABLE_RECENCY_THRESHOLD
+			):
 				self.is_large_table = True
 
-	def init_field_caches(self):
-		# field map
-		self._fields = {field.fieldname: field for field in self.fields}
+	@cached_property
+	def _fields(self):
+		return {field.fieldname: field for field in self.fields}
 
-		# table fields
+	@cached_property
+	def _table_fields(self):
 		if self.name == "DocType":
-			self._table_fields = DOCTYPE_TABLE_FIELDS
-		else:
-			self._table_fields = self.get("fields", {"fieldtype": ["in", table_fields]})
+			return DOCTYPE_TABLE_FIELDS
 
-		# table fieldname: doctype map
-		self._table_doctypes = {field.fieldname: field.options for field in self._table_fields}
+		return self.get("fields", {"fieldtype": ["in", table_fields]})
+
+	@cached_property
+	def _non_computed_table_fields(self):
+		if self.name == "DocType":
+			return self._table_fields
+
+		return self.get("fields", {"fieldtype": ["in", table_fields], "is_virtual": 0})
+
+	@cached_property
+	def _table_doctypes(self):
+		return {field.fieldname: field.options for field in self._table_fields}
+
+	@cached_property
+	def _non_computed_table_doctypes(self):
+		return {field.fieldname: field.options for field in self._non_computed_table_fields}
+
+	@cached_property
+	def ignore_versioning_fields(self) -> set[str]:
+		return {df.fieldname for df in self.fields if getattr(df, "ignore_versioning", False)}
+
+	def init_field_caches(self):
+		self._fields
+		self._table_fields
+		self._non_computed_table_fields
+		self._table_doctypes
+		self._non_computed_table_doctypes
 
 	def sort_fields(self):
 		"""
@@ -578,6 +620,13 @@ class Meta(Document):
 							# Break out to add this just after the last field
 							break
 						target_position = current_field
+				elif field.fieldtype == "Tab Break" and target_position in field_order:
+					# Find the next tab break and set target_position to just one field before,
+					# so the new tab is appended after the current tab instead of splitting it
+					for current_field in field_order[field_order.index(target_position) + 1 :]:
+						if self._fields[current_field].fieldtype == "Tab Break":
+							break
+						target_position = current_field
 				insertion_map.setdefault(target_position, []).append(field.fieldname)
 
 			else:
@@ -597,6 +646,7 @@ class Meta(Document):
 			field.idx = idx
 			sorted_fields.append(field)
 
+		assert len(sorted_fields) == len(field_order), "every field in field_order must map to a field"
 		self.fields = sorted_fields
 
 	def set_custom_permissions(self):
@@ -611,6 +661,10 @@ class Meta(Document):
 				filters=dict(parent=self.name),
 				update=dict(doctype="Custom DocPerm"),
 			)
+
+			if is_disabled_app_filtering_active():
+				custom_perms = [d for d in custom_perms if not d.get("is_app_disabled")]
+
 			if custom_perms:
 				self.permissions = [Document(d) for d in custom_perms]
 
@@ -647,7 +701,7 @@ class Meta(Document):
 
 	@cached_property
 	def high_permlevel_fields(self):
-		return [df for df in self.fields if df.permlevel > 0]
+		return [df for df in self.fields if (df.permlevel or 0) > 0]
 
 	def get_permitted_fieldnames(
 		self,
@@ -680,7 +734,8 @@ class Meta(Document):
 		)
 
 		if 0 not in permlevel_access and permission_type in ("read", "select"):
-			if frappe.share.get_shared(self.name, user, rights=[permission_type], limit=1):
+			check_doctype = parenttype if self.istable and parenttype else self.name
+			if frappe.share.get_shared(check_doctype, user, rights=["read"], limit=1):
 				permlevel_access.add(0)
 
 		permitted_fieldnames.extend(
@@ -693,12 +748,11 @@ class Meta(Document):
 		return permitted_fieldnames
 
 	def get_permlevel_access(self, permission_type="read", parenttype=None, *, user=None):
-		has_access_to = []
+		has_access_to = set()
 		roles = set(frappe.get_roles(user))
 		for perm in self.get_permissions(parenttype):
 			if perm.role in roles and perm.get(permission_type):
-				if perm.permlevel not in has_access_to:
-					has_access_to.append(perm.permlevel)
+				has_access_to.add(perm.permlevel)
 
 		return has_access_to
 
@@ -768,11 +822,21 @@ class Meta(Document):
 						group.get("items").append(doctype)
 					link.added = True
 
+					# Add fieldname to transaction group for external links
+					if not link.is_child_table:
+						if "fieldnames" not in group:
+							group["fieldnames"] = {}
+						group["fieldnames"][link.link_doctype] = link.link_fieldname
+
 			if not link.added:
 				# group not found, make a new group
-				data.transactions.append(
-					dict(label=link.group, items=[link.parent_doctype or link.link_doctype])
-				)
+				new_group = dict(label=link.group, items=[link.parent_doctype or link.link_doctype])
+
+				# Add fieldname to new transaction group for external links
+				if not link.is_child_table:
+					new_group["fieldnames"] = {link.link_doctype: link.link_fieldname}
+
+				data.transactions.append(new_group)
 
 			if not data.fieldname and link.link_fieldname:
 				data.fieldname = link.link_fieldname
@@ -806,11 +870,25 @@ class Meta(Document):
 #######
 
 
-def is_single(doctype):
-	try:
-		return frappe.db.get_value("DocType", doctype, "issingle")
-	except IndexError:
-		raise Exception("Cannot determine whether {} is single".format(doctype))
+def is_field_hidden_by_app(df) -> bool:
+	"""Return True for a customization belonging to, or pointing at, a disabled app.
+
+	A Link or Table field whose target is concealed cannot work, so it is hidden
+	regardless of which app declared it.
+	"""
+	from frappe.app_state import get_disabled_doctypes
+
+	# The app that owns this field sets the flag in its `before_disable` hook.
+	if df.get("is_app_disabled") and is_disabled_app_filtering_active():
+		return True
+
+	if is_module_disabled(df.get("module")):
+		return True
+
+	return (
+		df.get("fieldtype") in ("Link", "Table", "Table MultiSelect")
+		and df.get("options") in get_disabled_doctypes()
+	)
 
 
 def get_parent_dt(dt):
@@ -866,6 +944,12 @@ def get_field_currency(df, doc=None):
 					if frappe.get_meta(doc.parenttype).has_field(df.get("options")):
 						# only get_value if parent has currency field
 						currency = frappe.db.get_value(doc.parenttype, doc.parent, df.get("options"))
+						if not currency:
+							# Parent may not be in DB yet (new document being saved).
+							# Use the in-memory parent document reference if available.
+							parent = getattr(doc, "parent_doc", None)
+							if parent:
+								currency = parent.get(df.get("options"))
 
 		if currency:
 			frappe.local.field_currency.setdefault((doc.doctype, ref_docname), frappe._dict()).setdefault(
@@ -879,20 +963,32 @@ def get_field_currency(df, doc=None):
 
 def get_field_precision(df, doc=None, currency=None):
 	"""get precision based on DocField options and fieldvalue in doc"""
-	from frappe.locale import get_number_format
-
 	if df.precision:
 		precision = cint(df.precision)
 
 	elif df.fieldtype == "Currency":
-		precision = cint(frappe.db.get_default("currency_precision"))
-		if not precision:
-			number_format = get_number_format()
-			precision = number_format.precision
+		currency_precision = get_currency_precision()
+		if currency_precision is not None:
+			precision = currency_precision
+		else:
+			precision = get_precision_from_currency_format(currency or get_field_currency(df, doc))
 	else:
 		precision = cint(frappe.db.get_default("float_precision")) or 3
 
+	assert isinstance(precision, int), "computed field precision must be an integer"
 	return precision
+
+
+def get_precision_from_currency_format(currency: str) -> int:
+	"""Get precision from currency format string if applicable."""
+	from frappe.utils.number_format import NumberFormat
+
+	use_format_from_currency = frappe.get_system_settings("use_number_format_from_currency")
+	number_format = NumberFormat.from_string(frappe.db.get_default("number_format"))
+	if use_format_from_currency:
+		currency_format = frappe.db.get_value("Currency", currency, "number_format", cache=True)
+		number_format = NumberFormat.from_string(currency_format) if currency_format else number_format
+	return number_format.precision
 
 
 def get_default_df(fieldname):
@@ -915,6 +1011,8 @@ def trim_tables(doctype=None, dry_run=False, quiet=False):
 	as maintenance since removing a field in a DocType doesn't automatically
 	delete the db field.
 	"""
+	import click
+
 	UPDATED_TABLES = {}
 	filters = {"issingle": 0, "is_virtual": 0}
 	if doctype:
@@ -983,6 +1081,34 @@ def _update_field_order_based_on_insert_after(field_order, insert_after_map):
 			field_order.extend(fields)
 
 
+CACHE_PROPERTIES = frozenset(prop for prop, value in vars(Meta).items() if isinstance(value, cached_property))
+
+
+def _serialize(doc, no_nulls=False, *, is_child=False):
+	out = frappe._dict()
+	for key, value in doc.__dict__.items():
+		if not is_child:
+			if key in CACHE_PROPERTIES:
+				continue
+
+			if isinstance(value, ListOrTuple):
+				if value and isinstance(value[0], BaseDocument):
+					out[key] = [_serialize(d, no_nulls=no_nulls, is_child=True) for d in value]
+
+				continue
+
+		if (not no_nulls and value is None) or isinstance(value, SerializableTypes):
+			out[key] = value
+
+	if not is_child:
+		# set empty lists for unset table fields
+		for fieldname in TABLE_DOCTYPES_FOR_DOCTYPE:
+			if out.get(fieldname) is None:
+				out[fieldname] = []
+
+	return out
+
+
 if typing.TYPE_CHECKING:
 	# This is DX hack to add all fields from DocType to meta for autocompletions.
 	# Meta is technically doctype + special fields on meta.
@@ -990,3 +1116,7 @@ if typing.TYPE_CHECKING:
 
 	class _Meta(Meta, DocType):
 		pass
+
+
+# backward compatibility
+is_single = is_single_doctype

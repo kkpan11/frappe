@@ -1,7 +1,7 @@
 context("Attach Control", () => {
 	before(() => {
 		cy.login();
-		cy.visit("/app/doctype");
+		cy.visit("/desk/doctype");
 		return cy
 			.window()
 			.its("frappe")
@@ -53,9 +53,8 @@ context("Attach Control", () => {
 		//Deleting the doc
 		cy.go_to_list("Test Attach Control");
 		cy.get(".list-row-checkbox").eq(0).click();
-		cy.get(".actions-btn-group > .btn").contains("Actions").click();
-		cy.get('.actions-btn-group > .dropdown-menu [data-label="Delete"]').click();
-		cy.click_modal_primary_button("Yes");
+		cy.click_action_button("Delete");
+		cy.click_modal_primary_button("Delete");
 	});
 
 	it('Checking functionality for "Library" button in the "Attach" fieldtype', () => {
@@ -109,16 +108,15 @@ context("Attach Control", () => {
 		cy.go_to_list("Test Attach Control");
 		cy.get(".list-row-checkbox").eq(0).click();
 		cy.get(".list-row-checkbox").eq(1).click();
-		cy.get(".actions-btn-group > .btn").contains("Actions").click();
-		cy.get('.actions-btn-group > .dropdown-menu [data-label="Delete"]').click();
-		cy.click_modal_primary_button("Yes");
+		cy.click_action_button("Delete");
+		cy.click_modal_primary_button("Delete");
 	});
 
 	it('Checking that "Camera" button in the "Attach" fieldtype does show if camera is available', () => {
 		//Navigating to the new form for the newly created doctype
 		let doctype = "Test Attach Control";
 		let dt_in_route = doctype.toLowerCase().replace(/ /g, "-");
-		cy.visit(`/app/${dt_in_route}/new`, {
+		cy.visit(`/desk/${dt_in_route}/new`, {
 			onBeforeLoad(win) {
 				// Mock "window.navigator.mediaDevices" property
 				// to return mock mediaDevices object
@@ -144,7 +142,7 @@ context("Attach Control", () => {
 		//Navigating to the new form for the newly created doctype
 		let doctype = "Test Attach Control";
 		let dt_in_route = doctype.toLowerCase().replace(/ /g, "-");
-		cy.visit(`/app/${dt_in_route}/new`, {
+		cy.visit(`/desk/${dt_in_route}/new`, {
 			onBeforeLoad(win) {
 				// Delete "window.navigator.mediaDevices" property
 				delete win.navigator.mediaDevices;
@@ -166,7 +164,7 @@ context("Attach Control", () => {
 context("Attach Control with Failed Document Save", () => {
 	before(() => {
 		cy.login();
-		cy.visit("/app/doctype");
+		cy.visit("/desk/doctype");
 		return cy
 			.window()
 			.its("frappe")
@@ -214,17 +212,20 @@ context("Attach Control with Failed Document Save", () => {
 		cy.intercept("POST", "/api/method/upload_file").as("upload_image");
 		cy.get(".modal-footer").findByRole("button", { name: "Upload" }).click({ delay: 500 });
 		cy.wait("@upload_image");
-		cy.get(".msgprint-dialog .modal-title").contains("Missing Fields").should("be.visible");
-		cy.hide_dialog();
-		cy.fill_field("text_field", "Random value", "Text Editor").wait(500);
-		cy.findByRole("button", { name: "Save" }).click().wait(500);
+
+		// After fix for #39480: uploading on a new doc should NOT trigger save/validation
+		cy.get(".msgprint-dialog").should("not.exist");
 
 		//Checking if the URL of the attached image is getting displayed in the field of the newly created doctype
 		cy.get(".attached-file > .ellipsis > .attached-file-link")
 			.should("have.attr", "href")
 			.and("equal", "https://wallpaperplay.com/walls/full/8/2/b/72402.jpg");
 
-		cy.get(".title-text").then(($value) => {
+		// Now fill mandatory field and save manually
+		cy.fill_field("text_field", "Random value", "Text Editor").wait(500);
+		cy.findByRole("button", { name: "Save" }).click().wait(500);
+
+		cy.get(".title-text-form").then(($value) => {
 			docname = $value.text();
 		});
 	});
@@ -238,6 +239,18 @@ context("Attach Control with Failed Document Save", () => {
 			.blur()
 			.wait(500);
 		cy.get('input[data-fieldname="attached_to_name"]').click().type(docname).blur();
+		cy.findByRole("button", { name: "+ Add a Filter" }).click();
+		cy.get(".fieldname-select-area .form-control")
+			.last()
+			.click()
+			.type("Attached To Doctype{enter}")
+			.blur()
+			.wait(500);
+		cy.get('input[data-fieldname="attached_to_doctype"]')
+			.last()
+			.click()
+			.type("Test Mandatory Attach Control")
+			.blur();
 		cy.get(".filter-popover .apply-filters").click({ force: true });
 		cy.get("header .level-right .list-count").should("contain.text", "1 of 1");
 	});

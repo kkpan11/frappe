@@ -31,7 +31,7 @@ from frappe.utils.scheduler import (
 	get_scheduler_status,
 	get_scheduler_tick,
 	is_dormant,
-	is_schduler_process_running,
+	is_scheduler_process_running,
 )
 
 
@@ -57,7 +57,7 @@ def health_check(step: str):
 			try:
 				return func(*args, **kwargs)
 			except Exception as e:
-				if frappe.flags.in_test:
+				if frappe.in_test:
 					raise
 				frappe.log(frappe.get_traceback())
 				# nosemgrep
@@ -70,7 +70,27 @@ def health_check(step: str):
 	return suppress_exception
 
 
+def get_scheduler_health_status() -> str:
+	scheduler_enabled = get_scheduler_status().get("status") == "active"
+
+	try:
+		scheduler_process_running = is_scheduler_process_running()
+	except Exception:
+		# get_redis_conn raises Exception when redis_queue is not configured.
+		return "Redis Unavailable"
+
+	if not scheduler_process_running:
+		return "Process Not Found"
+	elif is_dormant():
+		return "Dormant"
+	elif scheduler_enabled:
+		return "Active"
+	return "Inactive"
+
+
 class SystemHealthReport(Document):
+	_DOCTYPE_NAME = "System Health Report"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -188,22 +208,13 @@ class SystemHealthReport(Document):
 
 	@health_check("Scheduler")
 	def fetch_scheduler(self):
-		scheduler_enabled = get_scheduler_status().get("status") == "active"
-
-		if not is_schduler_process_running():
-			self.scheduler_status = "Process Not Found"
-		elif is_dormant():
-			self.scheduler_status = "Dormant"
-		elif scheduler_enabled:
-			self.scheduler_status = "Active"
-		else:
-			self.scheduler_status = "Inactive"
+		self.scheduler_status = get_scheduler_health_status()
 
 		lower_threshold = add_to_date(None, days=-7, as_datetime=True)
 		# Exclude "maybe" curently executing job
 		upper_threshold = add_to_date(None, minutes=-30, as_datetime=True)
 
-		mariadb_query = """
+		query = """
   				SELECT scheduled_job_type,
 					AVG(CASE WHEN status != 'Complete' THEN 1 ELSE 0 END) * 100 AS failure_rate
 				FROM `tabScheduled Job Log`
@@ -231,25 +242,10 @@ class SystemHealthReport(Document):
 				LIMIT 5
     	"""
 
-		sqlite_query = """
-				SELECT scheduled_job_type,
-					AVG(CASE WHEN status != 'Complete' THEN 1 ELSE 0 END) * 100 AS failure_rate
-				FROM `tabScheduled Job Log`
-				WHERE
-					creation > %(lower_threshold)s
-					AND modified > %(lower_threshold)s
-					AND creation < %(upper_threshold)s
-				GROUP BY scheduled_job_type
-				HAVING failure_rate > 0
-				ORDER BY failure_rate DESC
-				LIMIT 5
-		"""
-
 		failing_jobs = frappe.db.multisql(
 			{
-				"mariadb": mariadb_query,
 				"postgres": postgres_query,
-				"sqlite": sqlite_query,
+				"*": query,
 			},
 			{"lower_threshold": lower_threshold, "upper_threshold": upper_threshold},
 			as_dict=True,

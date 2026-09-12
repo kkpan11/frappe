@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import time
+import unittest
 from typing import TYPE_CHECKING
 
 import click
@@ -12,6 +13,19 @@ from frappe.utils.bench_helper import CliCtxObj
 
 if TYPE_CHECKING:
 	from frappe.testing import TestRunner
+	from frappe.tests.utils.test_capabilities import TestService
+
+
+def _parse_test_service(_context, _parameter, value: str | None) -> "TestService | None":
+	if value is None:
+		return None
+
+	from frappe.tests.utils.test_capabilities import TestService
+
+	try:
+		return TestService.from_cli_name(value)
+	except ValueError as error:
+		raise click.BadParameter(str(error)) from error
 
 
 def main(
@@ -32,8 +46,32 @@ def main(
 	debug: bool = False,
 	debug_exceptions: tuple[Exception] | None = None,
 	selected_categories: list[str] | None = None,
+	lightmode: bool = False,
+	test_service: "TestService | None" = None,
 ) -> None:
 	"""Main function to run tests"""
+	if lightmode:
+		from frappe.testing.config import TestParameters
+
+		test_params = TestParameters(
+			site=site,
+			app=app,
+			module=module,
+			doctype=doctype,
+			module_def=module_def,
+			verbose=verbose,
+			tests=tests,
+			force=force,
+			profile=profile,
+			junit_xml_output=junit_xml_output,
+			doctype_list_path=doctype_list_path,
+			failfast=failfast,
+			case=case,
+			test_service=test_service,
+		)
+		run_tests_in_light_mode(test_params)
+		return
+
 	import logging
 
 	from frappe.testing import (
@@ -84,6 +122,7 @@ def main(
 		"debug_exceptions",
 		"debug",
 		"selected_categories",
+		"test_service",
 	]:
 		param_value = locals()[param_name]
 		if param_value is not None:
@@ -109,6 +148,7 @@ def main(
 		pdb_on_exceptions=debug_exceptions,
 		selected_categories=selected_categories or [],
 		skip_before_tests=skip_before_tests,
+		test_service=test_service,
 	)
 
 	_initialize_test_environment(site, test_config)
@@ -121,7 +161,6 @@ def main(
 			verbosity=2 if testing_module_logger.getEffectiveLevel() < logging.INFO else 1,
 			tb_locals=testing_module_logger.getEffectiveLevel() <= logging.INFO,
 			cfg=test_config,
-			buffer=not debug,  # unfortunate as it messes up stdout/stderr output order
 		)
 
 		if doctype or doctype_list_path:
@@ -136,11 +175,14 @@ def main(
 			discover_all_tests(apps, runner)
 
 		results = []
+		global unittest_runner
 		for app, category, suite in runner.iterRun():
 			click.secho(
 				f"\nRunning {suite.countTestCases()} {category} tests for {app}", fg="cyan", bold=True
 			)
-			results.append([app, category, runner.run(suite)])
+			main_runner = unittest_runner if junit_xml_output and unittest_runner else runner
+			res = main_runner.run(suite)
+			results.append([app, category, res])
 
 		success = all(r.wasSuccessful() for _, _, r in results)
 		if not success:
@@ -155,6 +197,47 @@ def main(
 
 		end_time = time.time()
 		testing_module_logger.debug(f"Total test run time: {end_time - start_time:.3f} seconds")
+
+
+def run_tests_in_light_mode(test_params):
+	import cProfile
+	import pstats
+	from io import StringIO
+
+	from frappe.testing.loader import FrappeTestLoader
+	from frappe.testing.result import FrappeTestResult
+	from frappe.tests.utils import toggle_test_mode
+
+	# init environment
+	frappe.init(test_params.site)
+	if not frappe.db:
+		frappe.connect()
+
+	# disable scheduler
+	global scheduler_disabled_by_user
+	scheduler_disabled_by_user = frappe.utils.scheduler.is_scheduler_disabled(verbose=False)
+	if not scheduler_disabled_by_user:
+		frappe.utils.scheduler.disable_scheduler()
+	frappe.clear_cache()
+
+	toggle_test_mode(True)
+	suite = FrappeTestLoader().discover_tests(test_params)
+
+	if test_params.profile:
+		pr = cProfile.Profile()
+		pr.enable()
+
+	result = unittest.TextTestRunner(failfast=test_params.failfast, resultclass=FrappeTestResult).run(suite)
+
+	if test_params.profile:
+		pr.disable()
+		s = StringIO()
+		ps = pstats.Stats(pr, stream=s).sort_stats("cumulative")
+		ps.print_stats()
+		print(s.getvalue())
+
+	if not result.wasSuccessful():
+		sys.exit(1)
 
 
 def _setup_xml_output(junit_xml_output):
@@ -236,7 +319,11 @@ def _get_doctypes_for_module_def(app, module_def):
 @click.option("--coverage", is_flag=True, default=False)
 @click.option("--skip-test-records", is_flag=True, default=False, help="DEPRECATED")
 @click.option("--skip-before-tests", is_flag=True, default=False, help="Don't run before tests hook")
-@click.option("--junit-xml-output", help="Destination file path for junit xml report")
+@click.option(
+	"--junit-xml-output",
+	type=click.Path(dir_okay=False, file_okay=True, resolve_path=True),
+	help="Destination file path for junit xml report",
+)
 @click.option(
 	"--failfast", is_flag=True, default=False, help="Stop the test run on the first error or failure"
 )
@@ -246,6 +333,13 @@ def _get_doctypes_for_module_def(app, module_def):
 	default="all",
 	help="Select test category to run",
 )
+@click.option(
+	"--test-service",
+	callback=_parse_test_service,
+	metavar="SERVICE",
+	help="Run only tests that declare a required service (for example, web-server).",
+)
+@click.option("--lightmode", is_flag=True, default=False)
 @pass_context
 def run_tests(
 	context: CliCtxObj,
@@ -263,6 +357,8 @@ def run_tests(
 	failfast=False,
 	case=None,
 	test_category="all",
+	lightmode=False,
+	test_service=None,
 	debug=False,
 ):
 	"""Run python unit-tests"""
@@ -307,6 +403,8 @@ def run_tests(
 			skip_before_tests=skip_before_tests,
 			debug=debug,
 			selected_categories=[] if test_category == "all" else test_category,
+			lightmode=lightmode,
+			test_service=test_service,
 		)
 
 
@@ -322,6 +420,8 @@ def run_tests(
 )
 @click.option("--use-orchestrator", is_flag=True, help="Use orchestrator to run parallel tests")
 @click.option("--dry-run", is_flag=True, default=False, help="Dont actually run tests")
+@click.option("--lightmode", is_flag=True, default=False, help="Skips all before test setup")
+@click.option("--failfast", is_flag=True, default=False, help="Exit on first failure occurred")
 @pass_context
 def run_parallel_tests(
 	context: CliCtxObj,
@@ -331,6 +431,8 @@ def run_parallel_tests(
 	with_coverage=False,
 	use_orchestrator=False,
 	dry_run=False,
+	lightmode=False,
+	failfast=False,
 ):
 	from traceback_with_variables import activate_by_import
 
@@ -351,6 +453,8 @@ def run_parallel_tests(
 				build_number=build_number,
 				total_builds=total_builds,
 				dry_run=dry_run,
+				lightmode=lightmode,
+				failfast=failfast,
 			)
 		mode = "Orchestrator" if use_orchestrator else "Parallel"
 		banner = f"""
@@ -384,17 +488,23 @@ def run_parallel_tests(
 @click.option("--parallel", is_flag=True, help="Run UI Test in parallel mode")
 @click.option("--with-coverage", is_flag=True, help="Generate coverage report")
 @click.option("--browser", default="chrome", help="Browser to run tests in")
+@click.option(
+	"--spec",
+	type=click.Path(dir_okay=False, file_okay=True),
+	help="Spec file to run",
+)
 @click.option("--ci-build-id")
 @pass_context
 def run_ui_tests(
 	context: CliCtxObj,
 	app,
 	headless=False,
-	parallel=True,
+	parallel=False,
 	with_coverage=False,
 	browser="chrome",
 	ci_build_id=None,
 	cypressargs=None,
+	spec=None,
 ):
 	"Run UI tests"
 	site = get_site(context)
@@ -410,12 +520,19 @@ def run_ui_tests(
 
 	os.chdir(app_base_path)
 
-	node_bin = subprocess.getoutput("(cd ../frappe && yarn bin)")
+	node_bin = subprocess.run(
+		"(cd ../frappe && yarn bin)",
+		shell=True,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.DEVNULL,
+		text=True,
+	).stdout.strip()
 	cypress_path = f"{node_bin}/cypress"
 	drag_drop_plugin_path = f"{node_bin}/../@4tw/cypress-drag-drop"
 	real_events_plugin_path = f"{node_bin}/../cypress-real-events"
 	testing_library_path = f"{node_bin}/../@testing-library"
 	coverage_plugin_path = f"{node_bin}/../@cypress/code-coverage"
+	cypress_split_path = f"{node_bin}/../cypress-split"
 
 	# check if cypress in path...if not, install it.
 	if not (
@@ -424,6 +541,7 @@ def run_ui_tests(
 		and os.path.exists(real_events_plugin_path)
 		and os.path.exists(testing_library_path)
 		and os.path.exists(coverage_plugin_path)
+		and os.path.exists(cypress_split_path)
 	):
 		# install cypress & dependent plugins
 		click.secho("Installing Cypress...", fg="yellow")
@@ -435,13 +553,28 @@ def run_ui_tests(
 				"@testing-library/cypress@^10",
 				"@testing-library/dom@8.17.1",
 				"@cypress/code-coverage@^3",
+				"cypress-split@^1.0.0",
 			]
 		)
+
+		# save package.json, install, then restore to avoid modifications
+		package_json_path = frappe.get_app_source_path("frappe", "package.json")
+		with open(package_json_path) as f:
+			package_json_contents = f.read()
+
 		frappe.commands.popen(f"(cd ../frappe && yarn add {packages} --no-lockfile)")
+
+		with open(package_json_path, "w") as f:
+			f.write(package_json_contents)
 
 	# run for headless mode
 	run_or_open = f"run --browser {browser}" if headless else "open"
-	formatted_command = f"{site_env} {password_env} {coverage_env} {cypress_path} {run_or_open}"
+	if headless and spec:
+		run_or_open += f" --spec {spec}"
+	parallel_env = "CYPRESS_CLOUD_PARALLEL=1" if parallel else "CYPRESS_CLOUD_PARALLEL=0"
+	formatted_command = (
+		f"{site_env} {password_env} {coverage_env} {parallel_env} {cypress_path} {run_or_open}"
+	)
 
 	if os.environ.get("CYPRESS_RECORD_KEY"):
 		formatted_command += " --record"

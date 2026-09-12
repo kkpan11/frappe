@@ -5,6 +5,7 @@
 # --------------------
 from pathlib import Path
 from shutil import which
+from urllib.parse import quote
 
 from frappe.database.database import savepoint
 
@@ -75,7 +76,7 @@ def get_db(socket=None, host=None, user=None, password=None, port=None, cur_db_n
 		import frappe.database.sqlite.database
 
 		return frappe.database.sqlite.database.SQLiteDatabase(cur_db_name=cur_db_name)
-	elif conf.use_mysqlclient:
+	elif conf.get("use_mysqlclient", 1):
 		import frappe.database.mariadb.mysqlclient
 
 		return frappe.database.mariadb.mysqlclient.MariaDBDatabase(
@@ -87,6 +88,35 @@ def get_db(socket=None, host=None, user=None, password=None, port=None, cur_db_n
 		return frappe.database.mariadb.database.MariaDBDatabase(
 			socket, host, user, password, port, cur_db_name
 		)
+
+
+def get_duckdb(read_only=True, filename=None):
+	import os
+
+	import duckdb
+
+	import frappe
+	from frappe.database.duckdb.database import DuckDBConnection
+
+	if not filename:
+		return
+
+	db_home = os.path.realpath(frappe.utils.get_files_path(is_private=True))
+	db_with_abs_path = os.path.join(db_home, filename)
+	return DuckDBConnection(duckdb.connect(f"{db_with_abs_path}", read_only=read_only))
+
+
+def delete_duckdb_file(filename=None):
+	import os
+
+	import frappe
+
+	db_home = os.path.realpath(frappe.utils.get_files_path(is_private=True))
+	db_with_abs_path = os.path.join(db_home, filename)
+	try:
+		os.remove(db_with_abs_path)
+	except FileNotFoundError:
+		return
 
 
 def get_command(
@@ -145,14 +175,20 @@ def get_command(
 		else:
 			bin, bin_name = which("psql"), "psql"
 
-		if socket and password:
-			conn_string = f"postgresql://{user}:{password}@/{db_name}?host={socket}"
-		elif socket:
-			conn_string = f"postgresql://{user}@/{db_name}?host={socket}"
-		elif password:
-			conn_string = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+		quoted_user = quote(user, safe="") if user else None
+		quoted_password = quote(password, safe="") if password else None
+
+		cred_prefix = ""
+		if quoted_user:
+			if quoted_password:
+				cred_prefix = f"{quoted_user}:{quoted_password}@"
+			else:
+				cred_prefix = f"{quoted_user}@"
+
+		if socket:
+			conn_string = f"postgresql://{cred_prefix}/{db_name}?host={socket}"
 		else:
-			conn_string = f"postgresql://{user}@{host}:{port}/{db_name}"
+			conn_string = f"postgresql://{cred_prefix}{host}:{port}/{db_name}"
 
 		command = [conn_string]
 

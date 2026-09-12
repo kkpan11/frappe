@@ -1,4 +1,5 @@
 import "./alt_keyboard_shortcuts";
+import { DropdownConsole } from "./dropdown_console";
 
 frappe.provide("frappe.ui.keys.handlers");
 
@@ -21,6 +22,13 @@ frappe.ui.keys.setup = function () {
 
 let standard_shortcuts = [];
 frappe.ui.keys.standard_shortcuts = standard_shortcuts;
+frappe.ui.keys.get_shortcut_label = function (shortcut) {
+	let label = shortcut.split("+").map(frappe.utils.to_title_case).join("+");
+	if (frappe.utils.is_mac()) {
+		label = label.replace("Ctrl+", "⌘").replace("Alt+", "⌥").replace("Shift+", "⇧");
+	}
+	return label;
+};
 frappe.ui.keys.add_shortcut = ({
 	shortcut,
 	action,
@@ -73,68 +81,77 @@ frappe.ui.keys.add_shortcut = ({
 	}
 };
 
+frappe.ui.keys.get_shortcut_groups = () => {
+	const page_name = window.cur_page?.page?.page;
+	const frm_name = window.cur_page?.page?.frm;
+	return [
+		{ heading: __("Global Shortcuts"), shortcuts: standard_shortcuts.filter((s) => !s.page) },
+		{
+			heading: __("Page Shortcuts"),
+			shortcuts: standard_shortcuts.filter((s) => s.page && s.page === page_name),
+		},
+		{
+			heading: __("Grid Shortcuts"),
+			shortcuts: standard_shortcuts.filter((s) => s.page && s.page === frm_name),
+		},
+	];
+};
+
+frappe.ui.keys.generate_shortcuts_html = (shortcuts, heading) => {
+	if (!shortcuts.length) return "";
+
+	const deduped = [];
+	const seen = {};
+	shortcuts
+		.filter((s) => (s.condition ? s.condition() : true))
+		.filter((s) => !!s.description)
+		.forEach((shortcut) => {
+			if (seen[shortcut.description] !== undefined) {
+				deduped[seen[shortcut.description]].keys.push(shortcut.shortcut);
+			} else {
+				seen[shortcut.description] = deduped.length;
+				deduped.push({ ...shortcut, keys: [shortcut.shortcut] });
+			}
+		});
+
+	const rows = deduped
+		.map((shortcut) => {
+			const shortcut_label = shortcut.keys
+				.map(
+					(k) =>
+						`<kbd>${frappe.utils.escape_html(
+							frappe.ui.keys.get_shortcut_label(k)
+						)}</kbd>`
+				)
+				.join(" / ");
+			const description = frappe.utils.escape_html(shortcut.description || "");
+			return `<tr>
+				<td width="40%">${shortcut_label}</td>
+				<td width="60%">${description}</td>
+			</tr>`;
+		})
+		.join("");
+	if (!rows) return "";
+
+	return `<h5 style="margin: 0;">${heading}</h5>
+		<table style="margin-top: 10px;" class="table table-bordered">
+			${rows}
+		</table>`;
+};
+
 frappe.ui.keys.show_keyboard_shortcut_dialog = () => {
 	if (frappe.ui.keys.is_dialog_shown) return;
 
-	let global_shortcuts = standard_shortcuts.filter((shortcut) => !shortcut.page);
-	let current_page_shortcuts = standard_shortcuts.filter(
-		(shortcut) => shortcut.page && shortcut.page === window.cur_page.page.page
-	);
-
-	let grid_shortcuts = standard_shortcuts.filter(
-		(shortcut) => shortcut.page && shortcut.page === window.cur_page.page.frm
-	);
-
-	function generate_shortcuts_html(shortcuts, heading) {
-		if (!shortcuts.length) {
-			return "";
-		}
-		let html = shortcuts
-			.filter((s) => (s.condition ? s.condition() : true))
-			.filter((s) => !!s.description)
-			.map((shortcut) => {
-				let shortcut_label = shortcut.shortcut
-					.split("+")
-					.map(frappe.utils.to_title_case)
-					.join("+");
-				if (frappe.utils.is_mac()) {
-					shortcut_label = shortcut_label.replace("Ctrl", "⌘").replace("Alt", "⌥");
-				}
-
-				shortcut_label = shortcut_label.replace("Shift", "⇧");
-
-				return `<tr>
-					<td width="40%"><kbd>${shortcut_label}</kbd></td>
-					<td width="60%">${shortcut.description || ""}</td>
-				</tr>`;
-			})
-			.join("");
-		if (!html) return "";
-
-		html = `<h5 style="margin: 0;">${heading}</h5>
-			<table style="margin-top: 10px;" class="table table-bordered">
-				${html}
-			</table>`;
-		return html;
-	}
-
-	let global_shortcuts_html = generate_shortcuts_html(global_shortcuts, __("Global Shortcuts"));
-	let current_page_shortcuts_html = generate_shortcuts_html(
-		current_page_shortcuts,
-		__("Page Shortcuts")
-	);
-	let grid_shortcuts_html = generate_shortcuts_html(grid_shortcuts, __("Grid Shortcuts"));
-
-	let dialog = new frappe.ui.Dialog({
+	const dialog = new frappe.ui.Dialog({
 		title: __("Keyboard Shortcuts"),
 		on_hide() {
 			frappe.ui.keys.is_dialog_shown = false;
 		},
 	});
 
-	dialog.$body.append(global_shortcuts_html);
-	dialog.$body.append(current_page_shortcuts_html);
-	dialog.$body.append(grid_shortcuts_html);
+	frappe.ui.keys.get_shortcut_groups().forEach(({ heading, shortcuts }) => {
+		dialog.$body.append(frappe.ui.keys.generate_shortcuts_html(shortcuts, heading));
+	});
 	dialog.$body.append(`
 		<div class="text-muted">
 			${__("Press Alt Key to trigger additional shortcuts in Menu and Sidebar")}
@@ -192,37 +209,26 @@ frappe.ui.keys.add_shortcut({
 		e.preventDefault();
 		return false;
 	},
-	description: __("Trigger Primary Action"),
+	description: __("Trigger primary action"),
+	ignore_inputs: true,
+});
+
+frappe.ui.keys.add_shortcut({
+	shortcut: "ctrl+k",
+	action: function (e) {
+		return frappe.search.open_awesomebar_from_global_search_shortcut?.(e);
+	},
+	description: __("Open Awesomebar"),
 	ignore_inputs: true,
 });
 
 frappe.ui.keys.add_shortcut({
 	shortcut: "ctrl+g",
 	action: function (e) {
-		$("#navbar-search").focus();
-		e.preventDefault();
-		return false;
+		return frappe.search.open_global_search_from_navbar_shortcut?.(e);
 	},
-	description: __("Open Awesomebar"),
-});
-
-frappe.ui.keys.add_shortcut({
-	shortcut: "ctrl+k",
-	action: function (e) {
-		$("#navbar-search").focus();
-		e.preventDefault();
-		return false;
-	},
-	description: __("Open Awesomebar"),
-});
-
-frappe.ui.keys.add_shortcut({
-	shortcut: "alt+s",
-	action: function (e) {
-		e.preventDefault();
-		$(".dropdown-navbar-user button").eq(0).click();
-	},
-	description: __("Open Settings"),
+	description: __("Open Global Search"),
+	ignore_inputs: true,
 });
 
 frappe.ui.keys.add_shortcut({
@@ -230,16 +236,7 @@ frappe.ui.keys.add_shortcut({
 	action: function () {
 		frappe.ui.keys.show_keyboard_shortcut_dialog();
 	},
-	description: __("Show Keyboard Shortcuts"),
-});
-
-frappe.ui.keys.add_shortcut({
-	shortcut: "alt+h",
-	action: function (e) {
-		e.preventDefault();
-		$(".dropdown-help button").eq(0).click();
-	},
-	description: __("Open Help"),
+	description: __("Show keyboard shortcuts"),
 });
 
 frappe.ui.keys.on("escape", function (e) {
@@ -283,7 +280,7 @@ frappe.ui.keys.add_shortcut({
 	action: function () {
 		frappe.ui.toolbar.clear_cache();
 	},
-	description: __("Clear Cache and Reload"),
+	description: __("Clear cache and reload"),
 });
 
 frappe.ui.keys.key_map = {
@@ -330,6 +327,7 @@ frappe.ui.keyCode = {
 function handle_escape_key() {
 	close_grid_and_dialog();
 	document.activeElement?.blur();
+	$(document).trigger("escape");
 }
 
 function close_grid_and_dialog() {
@@ -347,3 +345,31 @@ function close_grid_and_dialog() {
 		return false;
 	}
 }
+
+frappe.ui.keys.add_shortcut({
+	shortcut: "shift+t",
+	action: function (e) {
+		if (!frappe.model.can_write("System Console")) {
+			return;
+		}
+		if (cur_dialog?.is_minimized) {
+			cur_dialog.toggle_minimize();
+			cur_dialog.focus_on_first_input();
+		} else {
+			let dropdown_console = new DropdownConsole();
+			dropdown_console.show();
+		}
+	},
+	description: __("Open console"),
+});
+
+$.fn.enterKey = function (fnc) {
+	return this.each(function () {
+		$(this).keypress(function (ev) {
+			var keycode = ev.keyCode ? ev.keyCode : ev.which;
+			if (keycode == "13") {
+				fnc.call(this, ev);
+			}
+		});
+	});
+};

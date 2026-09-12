@@ -1,34 +1,15 @@
 // Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 // MIT License. See license.txt
 
+// The trail names the entity, never the shell it lives in: the dock names the app and the module
+// sidebar names the module and highlights the entity within it, so a workspace crumb would
+// repeat what the shell already says. This file therefore does not resolve an entity to a module
+// or a workspace; that is resolve_initial_sidebar's job, and its answer is a module. See
+// ui/sidebar/sidebar.js.
 frappe.breadcrumbs = {
 	all: {},
 
-	preferred: {
-		File: "",
-		Dashboard: "Customization",
-		"Dashboard Chart": "Customization",
-		"Dashboard Chart Source": "Customization",
-	},
-
-	module_map: {
-		Core: "Settings",
-		Email: "Settings",
-		Custom: "Settings",
-		Workflow: "Settings",
-		Printing: "Settings",
-		Setup: "Settings",
-		Automation: "Tools",
-	},
-
-	set_doctype_module(doctype, module) {
-		localStorage["preferred_breadcrumbs:" + doctype] = module;
-	},
-
-	get_doctype_module(doctype) {
-		return localStorage["preferred_breadcrumbs:" + doctype];
-	},
-
+	// `module` is kept in the signature for callers outside this app; nothing reads it.
 	add(module, doctype, type) {
 		let obj;
 		if (typeof module === "object") {
@@ -42,11 +23,24 @@ frappe.breadcrumbs = {
 		}
 		this.all[frappe.breadcrumbs.current_page()] = obj;
 		this.update();
-		frappe.app.sidebar.set_active_workspace_item();
 	},
 
 	current_page() {
 		return frappe.get_route_str();
+	},
+
+	set_tree_breadcrumb(breadcrumbs) {
+		const doctype = breadcrumbs.doctype;
+		const tree_title = frappe.treeview_settings?.[doctype]?.title || doctype;
+
+		this.append_breadcrumb_element(
+			`/desk/${frappe.router.slug(doctype)}`,
+			__(tree_title),
+			"title-text"
+		);
+
+		let tree_crumb = this.$breadcrumbs.find("li a.title-text").last();
+		tree_crumb.parent().addClass("ellipsis");
 	},
 
 	update() {
@@ -54,33 +48,53 @@ frappe.breadcrumbs = {
 
 		this.clear();
 		if (!breadcrumbs) return this.toggle(false);
-
 		if (breadcrumbs.type === "Custom") {
 			this.set_custom_breadcrumbs(breadcrumbs);
+			if (breadcrumbs.menu_items && breadcrumbs.menu_items.length) {
+				let breadcrumbs_container = $(".navbar-breadcrumbs");
+				breadcrumbs_container.each((index, container) => {
+					let last_element = $(container)
+						.find("li")
+						.get($(container).find("li").length - 1);
+					$(last_element).find("a").attr("href", "");
+					// `menu_items` follow frappe.ui.Dropdown's row shape: label, icon,
+					// onclick / href, condition, submenu.
+					new frappe.ui.Dropdown({
+						trigger: $(last_element),
+						options: breadcrumbs.menu_items,
+					});
+				});
+			}
 		} else {
-			// workspace
-			this.set_workspace_breadcrumb(breadcrumbs);
-
 			// form / print
 			let view = frappe.get_route()[0];
 			view = view ? view.toLowerCase() : null;
 			if (breadcrumbs.doctype && ["print", "form"].includes(view)) {
 				this.set_list_breadcrumb(breadcrumbs);
 				this.set_form_breadcrumb(breadcrumbs, view);
+			} else if (breadcrumbs.doctype && view === "tree") {
+				this.set_tree_breadcrumb(breadcrumbs);
 			} else if (breadcrumbs.doctype && view === "list") {
-				// pass
+				this.set_list_breadcrumb(breadcrumbs);
+				if (breadcrumbs.layout_name) {
+					const layout_info = (frappe.boot.doctype_layouts || []).find(
+						(l) => l.name === breadcrumbs.layout_name
+					);
+					const display_title = layout_info?.title || breadcrumbs.layout_name;
+					const $li = this.$breadcrumbs.find("li").last();
+					$li.after(
+						`<li class="disabled"><a>${frappe.utils.escape_html(
+							__(display_title)
+						)}</a></li>`
+					);
+				}
 			} else if (breadcrumbs.doctype && view == "dashboard-view") {
 				this.set_list_breadcrumb(breadcrumbs);
+				this.set_dashboard_breadcrumb(breadcrumbs);
+			} else if (view == "query-report") {
+				breadcrumbs.label = frappe.query_report.page_title;
+				this.append_breadcrumb_element("", breadcrumbs.label);
 			}
-		}
-
-		if (
-			breadcrumbs.workspace &&
-			frappe.workspace_map[breadcrumbs.workspace]?.app &&
-			frappe.workspace_map[breadcrumbs.workspace]?.app != frappe.current_app
-		) {
-			let app = frappe.workspace_map[breadcrumbs.workspace].app;
-			frappe.app.sidebar.apps_switcher.set_current_app(app);
 		}
 
 		this.toggle(true);
@@ -90,92 +104,18 @@ frappe.breadcrumbs = {
 		this.append_breadcrumb_element(breadcrumbs.route, breadcrumbs.label);
 	},
 
-	append_breadcrumb_element(route, label) {
+	append_breadcrumb_element(route, label, css_classes) {
 		const el = document.createElement("li");
 		const a = document.createElement("a");
-		a.href = route;
-		a.innerText = label;
+		if (route) {
+			a.href = route;
+		}
+		if (css_classes) {
+			a.classList.add(css_classes);
+		}
+		a.innerHTML = label;
 		el.appendChild(a);
 		this.$breadcrumbs.append(el);
-	},
-
-	get last_route() {
-		return frappe.route_history.slice(-2)[0];
-	},
-
-	set_workspace_breadcrumb(breadcrumbs) {
-		// get preferred module for breadcrumbs, based on history and module
-
-		if (!breadcrumbs.workspace) {
-			this.set_workspace(breadcrumbs);
-		}
-
-		if (!breadcrumbs.workspace) {
-			return;
-		}
-
-		if (
-			breadcrumbs.module_info &&
-			(breadcrumbs.module_info.blocked ||
-				!frappe.visible_modules.includes(breadcrumbs.module_info.module))
-		) {
-			return;
-		}
-
-		this.append_breadcrumb_element(
-			`/app/${frappe.router.slug(breadcrumbs.workspace)}`,
-			__(breadcrumbs.workspace)
-		);
-	},
-
-	set_workspace(breadcrumbs) {
-		// try and get module from doctype or other settings
-		// then get the workspace for that module
-
-		this.setup_modules();
-		var from_module = this.get_doctype_module(breadcrumbs.doctype);
-
-		if (from_module) {
-			breadcrumbs.module = from_module;
-		} else if (this.preferred[breadcrumbs.doctype] !== undefined) {
-			// get preferred module for breadcrumbs
-			breadcrumbs.module = this.preferred[breadcrumbs.doctype];
-		}
-
-		// guess from last route
-		if (this.last_route?.[0] == "Workspaces") {
-			let last_workspace = this.last_route[1];
-
-			if (
-				breadcrumbs.module &&
-				frappe.boot.module_wise_workspaces[breadcrumbs.module]?.includes(last_workspace)
-			) {
-				breadcrumbs.workspace = last_workspace;
-			}
-		} else {
-			// choose from __workspaces
-			const doctype_meta = frappe.get_meta(breadcrumbs.doctype);
-			if (doctype_meta?.__workspaces?.length) {
-				breadcrumbs.workspace = doctype_meta.__workspaces[0];
-			}
-
-			if (breadcrumbs.module) {
-				if (this.module_map[breadcrumbs.module]) {
-					breadcrumbs.module = this.module_map[breadcrumbs.module];
-				}
-
-				breadcrumbs.module_info = frappe.get_module(breadcrumbs.module);
-
-				// set workspace
-				if (
-					breadcrumbs.module_info &&
-					frappe.boot.module_wise_workspaces[breadcrumbs.module]
-				) {
-					breadcrumbs.workspace =
-						frappe.boot.module_wise_workspaces[breadcrumbs.module][0];
-				}
-			}
-		}
 	},
 
 	set_list_breadcrumb(breadcrumbs) {
@@ -188,55 +128,81 @@ frappe.breadcrumbs = {
 			// no user listview for non-system managers and single doctypes
 		} else {
 			let route;
-			const doctype_route = frappe.router.slug(frappe.router.doctype_layout || doctype);
+			const doctype_route = frappe.router.slug(doctype);
 			if (doctype_meta?.is_tree) {
 				let view = frappe.model.user_settings[doctype].last_view || "Tree";
 				route = `${doctype_route}/view/${view}`;
 			} else {
 				route = doctype_route;
 			}
-			this.append_breadcrumb_element(`/app/${route}`, __(doctype));
+			const reset = breadcrumbs.layout_name ? "?reset_filters=1" : "";
+			this.append_breadcrumb_element(`/desk/${route}${reset}`, __(doctype), "title-text");
 		}
+
+		let list_crumb = this.$breadcrumbs.find("li a.title-text");
+		list_crumb.parent().addClass("ellipsis");
 	},
 
 	set_form_breadcrumb(breadcrumbs, view) {
 		const doctype = breadcrumbs.doctype;
 		let docname = frappe.get_route().slice(2).join("/");
 		let doc = frappe.get_doc(doctype, docname);
+		let form_route = `/desk/${frappe.router.slug(doctype)}/${encodeURIComponent(docname)}`;
 
-		if (doc.__islocal) return; // new doc, no breadcrumb required
+		let docname_title;
+		let is_new_doc = false;
+		if (docname.startsWith("new-" + doctype.toLowerCase().replace(/ /g, "-"))) {
+			docname_title = __("New {0}", [__(doctype)]);
+			is_new_doc = true;
+		} else {
+			let title = frappe.model.get_doc_title(doc);
+			docname_title = __(title) || __(doc.name);
+			if (frappe.utils.is_html(docname_title)) {
+				docname_title = strip_html(docname_title);
+			}
+		}
 
-		let title = frappe.model.get_doc_title(doc);
+		if (breadcrumbs.layout_name) {
+			const layout_info = (frappe.boot.doctype_layouts || []).find(
+				(l) => l.name === breadcrumbs.layout_name
+			);
+			const display_title = layout_info?.title || breadcrumbs.layout_name;
+			const doctype_slug = frappe.router.slug(doctype);
+			const filter_params = frappe.utils.parse_layout_condition_to_filters(
+				layout_info?.condition
+			);
+			filter_params._layout = breadcrumbs.layout_name;
+			const query = new URLSearchParams(filter_params).toString();
+			const layout_route = `/desk/${doctype_slug}${query ? "?" + query : ""}`;
+			this.append_breadcrumb_element(layout_route, __(display_title));
+		}
 
-		if (title == doc.name) return; // title and name are same, don't add breadcrumb
-
-		let form_route = `/app/${frappe.router.slug(doctype)}/${encodeURIComponent(docname)}`;
-		this.append_breadcrumb_element(form_route, doc.name);
+		this.append_breadcrumb_element(form_route, docname_title, "title-text-form");
 
 		if (view === "form") {
-			let last_crumb = this.$breadcrumbs.find("li").last();
+			let last_crumb = this.$breadcrumbs.find(".title-text-form").parent();
 			last_crumb.addClass("disabled");
-			last_crumb.css("cursor", "copy");
-			last_crumb.click((event) => {
-				event.stopImmediatePropagation();
-				frappe.utils.copy_to_clipboard(last_crumb.text());
-			});
+			if (frappe.is_mobile()) {
+				last_crumb.addClass("ellipsis");
+				last_crumb.find("a").addClass("ellipsis");
+			}
 		}
 	},
 
 	set_dashboard_breadcrumb(breadcrumbs) {
 		const doctype = breadcrumbs.doctype;
-		const docname = frappe.get_route()[1];
-		let dashboard_route = `/app/${frappe.router.slug(doctype)}/${docname}`;
-		$(`<li><a href="${dashboard_route}">${__(docname)}</a></li>`).appendTo(this.$breadcrumbs);
-	},
-
-	setup_modules() {
-		if (!frappe.visible_modules) {
-			frappe.visible_modules = $.map(frappe.boot.allowed_workspaces, (m) => {
-				return m.module;
-			});
-		}
+		// The page names the document it drew. The route segment is only a
+		// fallback, because it carries whatever casing the link used. The label is
+		// what the reader sees. An island may title a document differently from
+		// its name, and the route must still reach the document.
+		const docname = breadcrumbs.docname || frappe.get_route()[1];
+		const label = breadcrumbs.label || docname;
+		let dashboard_route = `/desk/${frappe.router.slug(doctype)}/${docname}`;
+		$(
+			`<li><a href="${frappe.utils.escape_html(dashboard_route)}">${frappe.utils.escape_html(
+				__(label)
+			)}</a></li>`
+		).appendTo(this.$breadcrumbs);
 	},
 
 	rename(doctype, old_name, new_name) {
@@ -248,7 +214,7 @@ frappe.breadcrumbs = {
 	},
 
 	clear() {
-		this.$breadcrumbs = $("#navbar-breadcrumbs").empty();
+		this.$breadcrumbs = $(".navbar-breadcrumbs").empty();
 	},
 
 	toggle(show) {
@@ -258,4 +224,10 @@ frappe.breadcrumbs = {
 			$("body").removeClass("no-breadcrumbs");
 		}
 	},
+
+	/**
+	 * Parse a layout condition string into URL query params for list filtering.
+	 * Handles AND-joined `doc.field OP value` comparisons.
+	 * Returns {} for conditions that contain || (OR) since those can't be expressed as simple filters.
+	 */
 };

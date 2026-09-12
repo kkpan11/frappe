@@ -25,7 +25,7 @@ def test_password_strength(password: str, user_inputs: "Iterable[object] | None"
 		# will still be checked.
 		password = password[:128]
 
-	result = zxcvbn(password, user_inputs)
+	result = zxcvbn(password, user_inputs, max_length=128)
 	result["feedback"] = get_feedback(result.get("score"), result.get("sequence"))
 	return result
 
@@ -185,5 +185,9 @@ def get_dictionary_match_feedback(match: "_Match", is_sole_match: bool) -> "Pass
 	# Match contains l33t speak substitutions
 	if match.get("l33t_entropy"):
 		suggestions.append(_("Predictable substitutions like '@' instead of 'a' don't help very much."))
+
+	if not (warning or suggestions):
+		warning = _("Common words are easy to guess.")
+		suggestions.extend([_("Use a few uncommon words together."), _("Add numbers or special characters.")])
 
 	return {"warning": warning, "suggestions": suggestions}

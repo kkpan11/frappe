@@ -24,8 +24,7 @@ def create_rq_users(set_admin_password=False, use_rq_auth=False):
 
 	acl_file_path = os.path.abspath("../config/redis_queue.acl")
 
-	with frappe.init_site():
-		acl_list, user_credentials = RedisQueue.gen_acl_list(set_admin_password=set_admin_password)
+	acl_list, user_credentials = RedisQueue.gen_acl_list(set_admin_password=set_admin_password)
 
 	with open(acl_file_path, "w") as f:
 		f.writelines([acl + "\n" for acl in acl_list])
@@ -61,7 +60,7 @@ def create_rq_users(set_admin_password=False, use_rq_auth=False):
 		)
 		click.secho(f"`export {env_key}={user_credentials['default'][1]}`")
 		click.secho(
-			"NOTE: Please save the admin password as you " "can not access redis server without the password",
+			"NOTE: Please save the admin password as you can not access redis server without the password",
 			fg="yellow",
 		)
 

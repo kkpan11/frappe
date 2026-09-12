@@ -7,6 +7,8 @@ from frappe.permissions import _pop_debug_log, has_permission
 
 
 class PermissionInspector(Document):
+	_DOCTYPE_NAME = "Permission Inspector"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -36,6 +38,11 @@ class PermissionInspector(Document):
 		ref_doctype: DF.Link
 		user: DF.Link
 	# end: auto-generated types
+
+	def onload(self):
+		from frappe.core.doctype.permission_type.permission_type import get_doctype_ptype_map
+
+		self.set_onload("doctype_ptype_map", get_doctype_ptype_map())
 
 	@frappe.whitelist()
 	def debug(self):

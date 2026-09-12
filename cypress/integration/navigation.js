@@ -2,7 +2,7 @@ context("Navigation", () => {
 	before(() => {
 		cy.visit("/login");
 		cy.login();
-		cy.visit("/app/website");
+		cy.visit("/desk/website");
 	});
 	it("Navigate to route with hash in document name", () => {
 		cy.insert_doc(
@@ -15,22 +15,22 @@ context("Navigation", () => {
 			},
 			true
 		);
-		cy.visit(`/app/client-script/${encodeURIComponent("ABC#123")}`);
+		cy.visit(`/desk/client-script/${encodeURIComponent("ABC#123")}`);
 		cy.title().should("eq", "ABC#123");
 		cy.go("back");
 		cy.title().should("eq", "Website");
 	});
 
 	it("Navigate to previous page after login", () => {
-		cy.visit("/app/todo");
+		cy.visit("/desk/todo");
 		cy.get(".page-head").findByTitle("To Do").should("be.visible");
 		cy.clear_filters();
 		cy.call("logout");
-		cy.reload().as("reload");
-		cy.get("@reload").get(".page-card .btn-primary").contains("Login").click();
+		cy.reload();
+		cy.findByRole("button", { name: "Continue" }).click();
 		cy.location("pathname").should("eq", "/login");
 		cy.login();
-		cy.reload().as("reload");
-		cy.location("pathname").should("eq", "/app/todo");
+		cy.visit("/desk/todo");
+		cy.location("pathname").should("eq", "/desk/todo");
 	});
 });

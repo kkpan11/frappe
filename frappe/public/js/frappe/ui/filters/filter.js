@@ -38,25 +38,6 @@ frappe.ui.Filter = class {
 
 		this.conditions.push(...this.nested_set_conditions);
 
-		this.invalid_condition_map = {
-			Date: ["like", "not like"],
-			Datetime: ["like", "not like", "in", "not in", "=", "!="],
-			Data: ["Between", "Timespan"],
-			Select: ["like", "not like", "Between", "Timespan"],
-			Link: ["Between", "Timespan", ">", "<", ">=", "<="],
-			Currency: ["Between", "Timespan"],
-			Color: ["Between", "Timespan"],
-			Check: this.conditions.map((c) => c[0]).filter((c) => c !== "="),
-			Code: ["Between", "Timespan", ">", "<", ">=", "<=", "in", "not in"],
-			"HTML Editor": ["Between", "Timespan", ">", "<", ">=", "<=", "in", "not in"],
-			"Markdown Editor": ["Between", "Timespan", ">", "<", ">=", "<=", "in", "not in"],
-			Password: ["Between", "Timespan", ">", "<", ">=", "<=", "in", "not in"],
-			Rating: ["like", "not like", "Between", "in", "not in", "Timespan"],
-			Int: ["like", "not like", "Between", "in", "not in", "Timespan"],
-			Float: ["like", "not like", "Between", "in", "not in", "Timespan"],
-			Percent: ["like", "not like", "Between", "in", "not in", "Timespan"],
-		};
-
 		this.special_condition_labels = {
 			Date: {
 				"<": __("Before"),
@@ -71,6 +52,80 @@ frappe.ui.Filter = class {
 				">=": __("On or After"),
 			},
 		};
+
+		this.set_invalid_conditions_map();
+	}
+
+	set_invalid_conditions_map() {
+		this.range_conditions = ["Between", "Timespan"];
+		this.comparison_conditions = [">", "<", ">=", "<="];
+		this.like_conditions = ["like", "not like"];
+		this.in_conditions = ["in", "not in"];
+		this.equality_conditions = ["=", "!="];
+
+		const text_fields = [
+			"Code",
+			"HTML Editor",
+			"Markdown Editor",
+			"Text Editor",
+			"Small Text",
+			"Long Text",
+			"Text",
+			"Password",
+		];
+
+		const numeric_fields = ["Rating", "Int", "Float", "Percent"];
+
+		const text_invalid_conditions = [
+			...this.range_conditions,
+			...this.comparison_conditions,
+			...this.in_conditions,
+		];
+
+		const numeric_invalid_conditions = [
+			...this.like_conditions,
+			...this.range_conditions,
+			...this.in_conditions,
+		];
+
+		this.invalid_condition_map = {
+			Date: this.like_conditions,
+			Time: this.range_conditions,
+			Data: this.range_conditions,
+			Currency: this.range_conditions,
+
+			Link: [...this.range_conditions, ...this.comparison_conditions],
+			Color: [...this.range_conditions, ...this.comparison_conditions],
+
+			Datetime: [
+				...this.like_conditions,
+				...this.in_conditions,
+				...this.equality_conditions,
+			],
+			Select: [
+				...this.like_conditions,
+				...this.range_conditions,
+				...this.comparison_conditions,
+			],
+
+			Check: this.conditions
+				.map(([condition]) => condition)
+				.filter((condition) => condition !== "="),
+
+			...Object.fromEntries(
+				text_fields.map((field) => [field, [...text_invalid_conditions]])
+			),
+
+			...Object.fromEntries(
+				numeric_fields.map((field) => [field, [...numeric_invalid_conditions]])
+			),
+		};
+
+		// conditions where a Dynamic Link can resolve to a real Link picker
+		this.link_friendly_conditions = new Set([
+			...this.equality_conditions,
+			...this.nested_set_conditions.map(([cond]) => cond),
+		]);
 	}
 
 	set_conditions_from_config() {
@@ -123,6 +178,13 @@ frappe.ui.Filter = class {
 			this.on_change();
 		});
 
+		this.filter_edit_area.find(".remove-filter").on("keydown", (e) => {
+			if (e.key === "Enter" || e.key === " ") {
+				e.preventDefault();
+				$(e.currentTarget).trigger("click");
+			}
+		});
+
 		this.filter_edit_area.find(".condition").change(() => {
 			if (!this.field) return;
 
@@ -130,7 +192,10 @@ frappe.ui.Filter = class {
 			let fieldtype = null;
 
 			if (["in", "like", "not in", "not like"].includes(condition)) {
-				fieldtype = "Data";
+				const is_user_array = ["_assign", "_liked_by"].includes(this.field.df.fieldname);
+				if (!(is_user_array && ["like", "not like"].includes(condition))) {
+					fieldtype = "Data";
+				}
 				this.add_condition_help(condition);
 			} else {
 				this.filter_edit_area.find(".filter-description").empty();
@@ -144,6 +209,8 @@ frappe.ui.Filter = class {
 			}
 
 			this.set_field(this.field.df.parent, this.field.df.fieldname, fieldtype, condition);
+
+			this.get_filter_group()?.refresh_dynamic_link_filters?.();
 		});
 	}
 
@@ -202,13 +269,16 @@ frappe.ui.Filter = class {
 		this._filter_value_set = Promise.resolve();
 
 		if (["in", "not in"].includes(condition) && Array.isArray(value)) {
-			value = value.join(",");
+			value = value.some((v) => String(v).includes(","))
+				? JSON.stringify(value)
+				: value.join(",");
 		}
 
 		if (Array.isArray(value)) {
 			this._filter_value_set = this.field.set_value(value);
-		} else if (value !== undefined || value !== null) {
-			this._filter_value_set = this.field.set_value((value + "").trim());
+		} else if (value !== undefined && value !== null) {
+			const field_value = typeof value === "number" ? value : String(value).trim();
+			this._filter_value_set = this.field.set_value(field_value);
 		}
 		return this._filter_value_set;
 	}
@@ -238,6 +308,8 @@ frappe.ui.Filter = class {
 		this.set_condition(c);
 
 		this.utils.set_fieldtype(df, fieldtype, this.get_condition());
+
+		this.resolve_dynamic_link(df, original_docfield);
 
 		// called when condition is changed,
 		// don't change if all is well
@@ -332,7 +404,6 @@ frappe.ui.Filter = class {
 			this.field.df.fieldname,
 			this.get_condition(),
 			this.get_selected_value(),
-			this.hidden,
 		];
 	}
 
@@ -354,12 +425,51 @@ frappe.ui.Filter = class {
 		if (trigger_change) $condition_field.change();
 	}
 
+	get_filter_group() {
+		// `this.filter_list` is the FilterGroup in standalone use (dialogs, dashboards),
+		// but the parent ListView in list views — drill through to the actual FilterGroup.
+		return this.filter_list?.filter_area?.filter_list || this.filter_list;
+	}
+
+	resolve_dynamic_link(df, original_df) {
+		if (df.original_type !== "Dynamic Link") return;
+
+		if (!this.link_friendly_conditions.has(this.get_condition())) return;
+
+		// get the filter whose value this Dynamic Link filter depends on, if any
+		const peer = this.get_filter_group()?.get_filter?.(original_df.options);
+		const peer_value = peer?.get_selected_value?.();
+		const desc_element = this.get_description_element();
+
+		if (peer && peer.get_condition() === "=" && peer_value) {
+			df.fieldtype = "Link";
+			df.options = peer_value;
+			desc_element.empty();
+			return;
+		}
+
+		const peer_label = this.get_dynamic_link_peer_label(original_df);
+
+		desc_element.html(
+			__("Set <strong>{0}</strong> = <em>?</em> to auto complete", [__(peer_label)])
+		);
+	}
+
+	get_dynamic_link_peer_label(df) {
+		const peer_df = frappe.meta.get_docfield(df.parent, df.options);
+		return peer_df ? peer_df.label : df.options;
+	}
+
 	add_condition_help(condition) {
 		const description = ["in", "not in"].includes(condition)
 			? __("values separated by commas")
 			: __("use % as wildcard");
 
-		this.filter_edit_area.find(".filter-description").html(description);
+		this.get_description_element().html(description);
+	}
+
+	get_description_element() {
+		return this.filter_edit_area.find(".filter-description");
 	}
 
 	make_tag() {
@@ -400,7 +510,7 @@ frappe.ui.Filter = class {
 			</button>
 			<button class="btn btn-default btn-xs remove-filter"
 				title="${__("Remove Filter")}">
-				${frappe.utils.icon("close")}
+				${frappe.utils.icon("x")}
 			</button>
 		</div>`);
 	}
@@ -485,7 +595,15 @@ frappe.ui.filter_utils = {
 			}
 		} else if (["in", "not in"].includes(condition)) {
 			if (val) {
-				val = val.split(",").map((v) => strip(v));
+				try {
+					const parsed = JSON.parse(val);
+					val = Array.isArray(parsed) ? parsed : [String(parsed)];
+				} catch {
+					val = val
+						.split(",")
+						.map((v) => strip(v))
+						.filter((v) => v != null && v !== "");
+				}
 			}
 		} else if (frappe.boot.additional_filters_config[condition]) {
 			val = field.value || val;
@@ -505,7 +623,10 @@ frappe.ui.filter_utils = {
 
 	get_default_condition(df) {
 		const meta = frappe.get_meta(df.parent);
-		if (df.fieldtype == "Data" && !meta?.is_large_table) {
+		if (["_assign", "_liked_by"].includes(df.fieldname)) {
+			// stored as a JSON array, so an exact match can never hit
+			return "like";
+		} else if (df.fieldtype == "Data" && !meta?.is_large_table) {
 			return "like";
 		} else if (df.fieldtype == "Date" || df.fieldtype == "Datetime") {
 			return "Between";
@@ -531,7 +652,10 @@ frappe.ui.filter_utils = {
 		}
 
 		// scrub
-		if (df.fieldname == "docstatus") {
+		if (["_assign", "_liked_by"].includes(df.fieldname)) {
+			df.fieldtype = "Link";
+			df.options = "User";
+		} else if (df.fieldname == "docstatus") {
 			df.fieldtype = "Select";
 			df.options = [
 				{ value: 0, label: __("Draft") },
@@ -610,38 +734,144 @@ frappe.ui.filter_utils = {
 		return;
 	},
 
+	/**
+	 * Generates timespan options for filter dropdown based on provided periods
+	 * @param {Array<string>} periods - Array of period types to include
+	 *     (e.g., "Last", "This", "Next", "Yesterday", "Today", "Tomorrow").
+	 *     Additional custom values are allowed. The order of the periods is preserved.
+	 * @returns {Array<{label: string, value: string}>} Array of option objects with label and value properties for the filter dropdown
+	 */
 	get_timespan_options(periods) {
-		const period_map = {
-			Last: [
-				"7 Days",
-				"14 Days",
-				"30 Days",
-				"90 Days",
-				"Week",
-				"Month",
-				"Quarter",
-				"6 months",
-				"Year",
-			],
-			This: ["Week", "Month", "Quarter", "Year"],
-			Next: ["7 Days", "14 Days", "30 Days", "Week", "Month", "Quarter", "6 months", "Year"],
-		};
-		let options = [];
-		periods.forEach((period) => {
-			if (period_map[period]) {
-				period_map[period].forEach((p) => {
+		const last_options = [
+			{
+				label: __("Last 7 Days"),
+				value: "last 7 days",
+			},
+			{
+				label: __("Last 14 Days"),
+				value: "last 14 days",
+			},
+			{
+				label: __("Last 30 Days"),
+				value: "last 30 days",
+			},
+			{
+				label: __("Last 90 Days"),
+				value: "last 90 days",
+			},
+			{
+				label: __("Last Week"),
+				value: "last week",
+			},
+			{
+				label: __("Last Month"),
+				value: "last month",
+			},
+			{
+				label: __("Last Quarter"),
+				value: "last quarter",
+			},
+			{
+				label: __("Last 6 Months"),
+				value: "last 6 months",
+			},
+			{
+				label: __("Last Year"),
+				value: "last year",
+			},
+		];
+		const this_options = [
+			{
+				label: __("This Week"),
+				value: "this week",
+			},
+			{
+				label: __("This Month"),
+				value: "this month",
+			},
+			{
+				label: __("This Quarter"),
+				value: "this quarter",
+			},
+			{
+				label: __("This Year"),
+				value: "this year",
+			},
+		];
+		const next_options = [
+			{
+				label: __("Next 7 Days"),
+				value: "next 7 days",
+			},
+			{
+				label: __("Next 14 Days"),
+				value: "next 14 days",
+			},
+			{
+				label: __("Next 30 Days"),
+				value: "next 30 days",
+			},
+			{
+				label: __("Next Week"),
+				value: "next week",
+			},
+			{
+				label: __("Next Month"),
+				value: "next month",
+			},
+			{
+				label: __("Next Quarter"),
+				value: "next quarter",
+			},
+			{
+				label: __("Next 6 Months"),
+				value: "next 6 months",
+			},
+			{
+				label: __("Next Year"),
+				value: "next year",
+			},
+		];
+
+		const options = [];
+		for (const period of periods) {
+			switch (period) {
+				case "Last":
+					options.push(...last_options);
+					break;
+				case "This":
+					options.push(...this_options);
+					break;
+				case "Next":
+					options.push(...next_options);
+					break;
+				case "Yesterday":
 					options.push({
-						label: `${period} ${p}`,
-						value: `${period.toLowerCase()} ${p.toLowerCase()}`,
+						label: __("Yesterday"),
+						value: "yesterday",
 					});
-				});
-			} else {
-				options.push({
-					label: __(period),
-					value: `${period.toLowerCase()}`,
-				});
+					break;
+				case "Today":
+					options.push({
+						label: __("Today"),
+						value: "today",
+					});
+					break;
+				case "Tomorrow":
+					options.push({
+						label: __("Tomorrow"),
+						value: "tomorrow",
+					});
+					break;
+				default:
+					options.push({
+						label: __(period),
+						value: `${period.toLowerCase()}`,
+					});
+					break;
 			}
-		});
+		}
+
 		return options;
 	},
 };

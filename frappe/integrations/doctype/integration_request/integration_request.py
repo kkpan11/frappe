@@ -9,6 +9,8 @@ from frappe.model.document import Document
 
 
 class IntegrationRequest(Document):
+	_DOCTYPE_NAME = "Integration Request"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -27,6 +29,7 @@ class IntegrationRequest(Document):
 		request_description: DF.Data | None
 		request_headers: DF.Code | None
 		request_id: DF.Data | None
+		response_headers: DF.Code | None
 		status: DF.Literal["", "Queued", "Authorized", "Completed", "Cancelled", "Failed"]
 		url: DF.SmallText | None
 	# end: auto-generated types

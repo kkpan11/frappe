@@ -1,18 +1,21 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
-from enum import Enum
+from contextlib import suppress
+from enum import Enum, StrEnum
 
 from werkzeug.exceptions import NotFound
 from werkzeug.routing import Map, Submount
 from werkzeug.wrappers import Request, Response
 
 import frappe
-import frappe.client
 from frappe import _
+from frappe.modules.utils import get_doctype_app_map
+from frappe.monitor import add_data_to_monitor
 from frappe.utils.response import build_response
+from frappe.utils.telemetry.pulse.app_heartbeat_event import capture_app_heartbeat
 
 
-class ApiVersion(str, Enum):
+class ApiVersion(StrEnum):
 	V1 = "v1"
 	V2 = "v2"
 
@@ -41,18 +44,45 @@ def handle(request: Request):
 	        `DELETE` will delete
 	"""
 
+	if frappe.get_system_settings("log_api_requests"):
+		doc = frappe.get_doc(
+			{
+				"doctype": "API Request Log",
+				"path": request.path,
+				"user": frappe.session.user,
+				"method": request.method,
+			}
+		)
+		doc.deferred_insert()
+
 	try:
 		endpoint, arguments = API_URL_MAP.bind_to_environ(request.environ).match()
 	except NotFound:  # Wrap 404 - backward compatiblity
 		raise frappe.DoesNotExistError
 
+	assert callable(endpoint), "URL map must resolve to a callable endpoint"
 	data = endpoint(**arguments)
 	if isinstance(data, Response):
 		return data
 
 	if data is not None:
 		frappe.response["data"] = data
-	return build_response("json")
+	data = build_response("json")
+
+	with suppress(Exception):
+		method = arguments.get("method") or frappe.form_dict.get("method")
+		doctype = arguments.get("doctype") or frappe.form_dict.get("doctype")
+		if method or doctype:
+			app_name = None
+			if doctype:
+				app_name = get_doctype_app_map().get(doctype)
+			elif method and "." in method:
+				app_name = method.split(".", 1)[0]
+			if app_name:
+				add_data_to_monitor(app=app_name)
+				capture_app_heartbeat(app_name)
+
+	return data
 
 
 # Merge all API version routing rules

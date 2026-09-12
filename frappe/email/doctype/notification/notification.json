@@ -13,8 +13,7 @@
   "column_break_2",
   "channel",
   "slack_webhook_url",
-  "filters",
-  "subject",
+  "filters_section",
   "event",
   "document_type",
   "col_break_1",
@@ -27,9 +26,13 @@
   "value_changed",
   "sender",
   "send_system_notification",
+  "notification_type",
   "sender_email",
   "section_break_9",
+  "condition_type",
+  "filters_editor",
   "condition",
+  "filters",
   "column_break_6",
   "html_7",
   "property_section",
@@ -39,13 +42,18 @@
   "send_to_all_assignees",
   "recipients",
   "message_sb",
+  "subject",
   "message_type",
   "message",
+  "fetch_email_template",
   "message_examples",
   "view_properties",
   "column_break_25",
   "attach_print",
-  "print_format"
+  "print_format",
+  "column_break_llcs",
+  "attach_files",
+  "from_attach_field"
  ],
  "fields": [
   {
@@ -70,7 +78,7 @@
   },
   {
    "depends_on": "eval:doc.channel=='Slack'",
-   "description": "To use Slack Channel, add a <a href=\"#List/Slack%20Webhook%20URL/List\">Slack Webhook URL</a>.",
+   "description": "To use Slack Channel, add a <a href=\"#List/Slack%20Webhook%20URL/List\" rel=\"noopener noreferrer\">Slack Webhook URL</a>.",
    "fieldname": "slack_webhook_url",
    "fieldtype": "Link",
    "label": "Slack Channel",
@@ -79,12 +87,15 @@
   },
   {
    "fieldname": "filters",
-   "fieldtype": "Section Break",
-   "label": "Filters"
+   "fieldtype": "Code",
+   "hidden": 1,
+   "label": "Filters",
+   "options": "JSON",
+   "read_only": 1
   },
   {
    "depends_on": "eval: in_list(['Email', 'Slack', 'System Notification'], doc.channel)",
-   "description": "To add dynamic subject, use jinja tags like\n\n<div><pre><code>{{ doc.name }} Delivered</code></pre></div>",
+   "description": "For a dynamic subject, use Jinja tags like this: <code>{{ doc.name }} Delivered</code>",
    "fieldname": "subject",
    "fieldtype": "Data",
    "ignore_xss_filter": 1,
@@ -126,7 +137,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Send Alert On",
-   "options": "\nNew\nSave\nSubmit\nCancel\nDays After\nDays Before\nMinutes After\nMinutes Before\nValue Change\nMethod\nCustom",
+   "options": "\nNew\nSave\nSubmit\nCancel\nDays After\nDays Before\nMinutes After\nMinutes Before\nValue Change\nMethod",
    "reqd": 1,
    "search_index": 1
   },
@@ -178,6 +189,7 @@
    "fieldtype": "Section Break"
   },
   {
+   "depends_on": "eval:doc.condition_type===\"Python\"",
    "description": "Optional: The alert will be sent if this expression is true",
    "fieldname": "condition",
    "fieldtype": "Code",
@@ -190,9 +202,10 @@
    "fieldtype": "Column Break"
   },
   {
+   "depends_on": "eval:doc.condition_type===\"Python\"",
    "fieldname": "html_7",
    "fieldtype": "HTML",
-   "options": "<p><strong>Condition Examples:</strong></p>\n<pre>doc.status==\"Open\"<br>doc.due_date==nowdate()<br>doc.total &gt; 40000\n</pre>\n"
+   "options": "<p><strong>{{ __(\"Condition Examples\") }}:</strong></p>\n<pre><code class=\"language-python\">doc.status==\"Open\"<br>doc.due_date==nowdate()<br>doc.total &gt; 40000\n</code></pre>\n"
   },
   {
    "collapsible": 1,
@@ -226,7 +239,13 @@
   {
    "fieldname": "message_sb",
    "fieldtype": "Section Break",
-   "label": "Message"
+   "label": "Content"
+  },
+  {
+   "depends_on": "eval: frappe.meta.has_field('Notification', 'subject') || frappe.meta.has_field('Notification', 'message')",
+   "fieldname": "fetch_email_template",
+   "fieldtype": "Button",
+   "label": "Fetch from Email Template"
   },
   {
    "default": "Add your message here",
@@ -252,7 +271,7 @@
    "collapsible_depends_on": "attach_print",
    "fieldname": "column_break_25",
    "fieldtype": "Section Break",
-   "label": "Print Settings"
+   "label": "Attachment Settings"
   },
   {
    "default": "0",
@@ -274,6 +293,15 @@
    "fieldname": "send_system_notification",
    "fieldtype": "Check",
    "label": "Send System Notification"
+  },
+  {
+   "default": "Alert",
+   "depends_on": "eval: doc.channel === 'System Notification' || doc.send_system_notification",
+   "description": "Category for the in-app notification. Used for filtering and per-user email preferences.",
+   "fieldname": "notification_type",
+   "fieldtype": "Link",
+   "label": "Notification Type",
+   "options": "Notification Type"
   },
   {
    "default": "0",
@@ -311,12 +339,48 @@
    "fieldtype": "Datetime",
    "label": "Last Run",
    "read_only": 1
+  },
+  {
+   "default": "Python",
+   "fieldname": "condition_type",
+   "fieldtype": "Select",
+   "label": "Condition Type",
+   "options": "Python\nFilters"
+  },
+  {
+   "depends_on": "eval:doc.condition_type===\"Filters\"",
+   "fieldname": "filters_editor",
+   "fieldtype": "HTML",
+   "label": "Filters Editor"
+  },
+  {
+   "fieldname": "filters_section",
+   "fieldtype": "Section Break",
+   "label": "Filters"
+  },
+  {
+   "fieldname": "column_break_llcs",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "attach_files",
+   "fieldtype": "Select",
+   "label": "Attach Files",
+   "options": "\nFrom Field\nAll"
+  },
+  {
+   "depends_on": "eval:doc.attach_files === \"From Field\"",
+   "fieldname": "from_attach_field",
+   "fieldtype": "Select",
+   "label": "From Attach Field",
+   "mandatory_depends_on": "eval:doc.attach_files === \"From Field\""
   }
  ],
+ "grid_page_length": 50,
  "icon": "fa fa-envelope",
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2024-09-12 10:28:35.077180",
+ "modified": "2026-09-03 18:00:00.000001",
  "modified_by": "Administrator",
  "module": "Email",
  "name": "Notification",
@@ -334,6 +398,7 @@
    "write": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "creation",
  "sort_order": "DESC",
  "states": [],

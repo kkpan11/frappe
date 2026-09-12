@@ -42,7 +42,9 @@ function resize(e) {
 		<div class="default-state" v-else>
 			<div
 				class="actions"
-				v-if="store.form.layout.tabs.length == 1 && !store.read_only && !store.doc.istable"
+				v-if="
+					store.form.layout.tabs.length == 1 && !store.read_only && !store.is_layout_form
+				"
 			>
 				<button
 					class="new-tab-btn btn btn-default btn-xs"
@@ -84,8 +86,8 @@ function resize(e) {
 	align-items: center;
 	padding: var(--padding-sm);
 	background-color: var(--fg-color);
-	border-top-left-radius: var(--border-radius);
-	border-top-right-radius: var(--border-radius);
+	border-top-left-radius: var(--radius);
+	border-top-right-radius: var(--radius);
 
 	.tab {
 		display: flex;
@@ -94,7 +96,7 @@ function resize(e) {
 		width: 100%;
 		height: 32px;
 		background-color: var(--bg-gray);
-		border-radius: var(--border-radius-md);
+		border-radius: var(--radius-md);
 		border: 1px solid var(--dark-border-color);
 		cursor: pointer;
 

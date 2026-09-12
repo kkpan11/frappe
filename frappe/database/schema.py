@@ -5,10 +5,14 @@ from frappe import _
 from frappe.utils import cint, cstr, flt
 from frappe.utils.defaults import get_not_null_defaults
 
-# This matches anything that isn't [a-zA-Z0-9_]
+# This matches anything that isn't Unicode Word Characters, Numbers and Underscore.
 SPECIAL_CHAR_PATTERN = re.compile(r"[\W]", flags=re.UNICODE)
 
 VARCHAR_CAST_PATTERN = re.compile(r"varchar\(([\d]+)\)")
+
+CONFIGURABLE_DECIMAL_TYPES = ("Currency", "Float", "Percent")
+DEFAULT_DECIMAL_LENGTH = 21
+DEFAULT_DECIMAL_PRECISION = 9
 
 
 class InvalidColumnName(frappe.ValidationError):
@@ -142,7 +146,7 @@ class DBTable:
 					# case when the field is no longer a varchar
 					continue
 				current_length = current_length[0]
-				if cint(current_length) != cint(new_length):
+				if cint(current_length) > cint(new_length):
 					try:
 						# check for truncation
 						max_length = frappe.db.sql(
@@ -173,6 +177,13 @@ class DBTable:
 
 	def alter(self):
 		pass
+
+
+NOT_NULL_TYPES = ("Check", "Int", "Currency", "Float", "Percent")
+
+assert set(CONFIGURABLE_DECIMAL_TYPES) <= set(NOT_NULL_TYPES), (
+	"configurable decimal types must be a subset of not-null types"
+)
 
 
 class DbColumn:
@@ -216,13 +227,14 @@ class DbColumn:
 		default = None
 		unique = False
 
+		if self.fieldtype in NOT_NULL_TYPES:
+			null = False
+
 		if self.fieldtype in ("Check", "Int"):
 			default = cint(self.default)
-			null = False
 
 		elif self.fieldtype in ("Currency", "Float", "Percent"):
 			default = flt(self.default)
-			null = False
 
 		elif (
 			self.default
@@ -271,7 +283,10 @@ class DbColumn:
 			return
 
 		# type
-		if current_def["type"] != column_type:
+		if current_def["type"] != column_type and not (
+			# XXX: MariaDB JSON is same as longtext and information schema still returns longtext
+			current_def["type"] == "longtext" and column_type == "json" and frappe.db.db_type == "mariadb"
+		):
 			self.table.change_type.append(self)
 
 		# unique
@@ -289,7 +304,11 @@ class DbColumn:
 			self.table.set_default.append(self)
 
 		# nullability
-		if self.not_nullable is not None and (self.not_nullable != current_def.get("not_nullable")):
+		if (
+			self.not_nullable is not None
+			and (self.not_nullable != current_def.get("not_nullable"))
+			and self.fieldtype not in NOT_NULL_TYPES
+		):
 			self.table.change_nullability.append(self)
 
 		# index should be applied or dropped irrespective of type change
@@ -310,24 +329,36 @@ class DbColumn:
 			else:
 				# Strip quotes from default value
 				# eg. database returns default value as "'System Manager'"
-				cur_default = cur_default.lstrip("'").rstrip("'")
+				cur_default = cur_default.lstrip("'").rstrip("'").replace("\\\\", "\\")
 
 			fieldtype = self.fieldtype
+			db_field_type = frappe.db.type_map.get(fieldtype)
 			if fieldtype in ["Int", "Check"]:
 				cur_default = cint(cur_default)
 				new_default = cint(new_default)
 			elif fieldtype in ["Currency", "Float", "Percent"]:
 				cur_default = flt(cur_default)
 				new_default = flt(new_default)
+			elif fieldtype == "Time":
+				return self.default_changed_for_time(cur_default, new_default)
+			elif db_field_type and db_field_type[0] in ("varchar", "longtext", "text"):
+				new_default = cstr(new_default)
+				if not current_def.get("not_nullable"):
+					cur_default = cstr(cur_default)
 			return cur_default != new_default
 
 	def default_changed_for_decimal(self, current_def):
+		cur_default = current_def["default"]
+		if cur_default == "NULL":
+			cur_default = None
 		try:
-			if current_def["default"] in ("", None) and self.default in ("", None):
-				# both none, empty
+			if cur_default in ("", None) and self.default in ("", None):
 				return False
 
-			elif current_def["default"] in ("", None):
+			elif flt(cur_default) == 0.0 and flt(self.default) == 0.0:
+				return False
+
+			elif cur_default in ("", None):
 				try:
 					# check if new default value is valid
 					float(self.default)
@@ -341,9 +372,27 @@ class DbColumn:
 
 			else:
 				# NOTE float() raise ValueError when "" or None is passed
-				return float(current_def["default"]) != float(self.default)
+				return float(cur_default) != float(self.default)
 		except TypeError:
 			return True
+
+	def default_changed_for_time(self, cur_default: str, new_default: str):
+		from datetime import datetime
+
+		# Normalize time values to HH:MM:SS.ssssss format, from formats: HH:MM:SS.ssssss, HH:MM:SS, HH:MM
+		def normalize_time(val):
+			if not val:
+				return None
+			for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
+				try:
+					return datetime.strptime(val, fmt).time().strftime("%H:%M:%S.%f")
+				except ValueError:
+					continue
+			return val
+
+		cur = normalize_time(cur_default)
+		new = normalize_time(new_default)
+		return cur != new
 
 
 def validate_column_name(n):
@@ -363,8 +412,13 @@ def validate_column_length(fieldname):
 		frappe.throw(_("Fieldname is limited to 64 characters ({0})").format(fieldname))
 
 
-def get_definition(fieldtype, precision=None, length=None, *, options=None):
-	d = frappe.db.type_map.get(fieldtype)
+def get_definition(fieldtype, precision=None, length=None, *, options=None, duckdb=False):
+	if duckdb:
+		from frappe.database.duckdb.database import get_type_map
+
+		d = get_type_map().get(fieldtype)
+	else:
+		d = frappe.db.type_map.get(fieldtype)
 
 	if (
 		fieldtype == "Link"
@@ -388,13 +442,20 @@ def get_definition(fieldtype, precision=None, length=None, *, options=None):
 	size = d[1] if d[1] else None
 
 	if size:
-		# This check needs to exist for backward compatibility.
-		# Till V13, default size used for float, currency and percent are (18, 6).
-		if fieldtype in ["Float", "Currency", "Percent"] and cint(precision) > 6:
-			size = "21,9"
+		if fieldtype in CONFIGURABLE_DECIMAL_TYPES:
+			width = length if length else DEFAULT_DECIMAL_LENGTH
+			precision_is_set = precision not in (None, "")
+			precision = precision if precision_is_set else DEFAULT_DECIMAL_PRECISION
+			if cint(precision) > cint(width):
+				precision = width
+			assert cint(precision) <= cint(width), "decimal precision must not exceed width"
+			size = f"{cint(width)},{cint(precision)}"
 
 		if length:
 			if coltype == "varchar":
+				# Reference: https://mariadb.com/docs/server/server-usage/storage-engines/innodb/innodb-row-formats/troubleshooting-row-size-too-large-errors-with-innodb
+				if cint(length) < 64:
+					length = 64
 				size = length
 			elif coltype == "int" and length < 11:
 				# allow setting custom length for int if length provided is less than 11

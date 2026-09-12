@@ -36,7 +36,7 @@
   "default_incoming",
   "column_break_uynb",
   "attachment_limit",
-  "last_synced_at",
+  "last_received_at",
   "mailbox_settings",
   "use_imap",
   "use_ssl",
@@ -66,6 +66,11 @@
   "always_use_account_name_as_sender_name",
   "send_unsubscribe_message",
   "track_email_status",
+  "headers_section",
+  "column_break_mcbu",
+  "add_x_original_from",
+  "add_reply_to_header",
+  "reply_to_addresses",
   "outgoing_mail_settings",
   "use_tls",
   "use_ssl_for_outgoing",
@@ -73,6 +78,7 @@
   "smtp_port",
   "column_break_38",
   "no_smtp_authentication",
+  "dsn_notify_type",
   "always_bcc",
   "signature_section",
   "add_signature",
@@ -83,9 +89,11 @@
   "set_footer",
   "footer",
   "brand_logo",
+  "section_break_jdoz",
   "uidvalidity",
   "uidnext",
-  "no_failed"
+  "no_failed",
+  "column_break_wojv"
  ],
  "fields": [
   {
@@ -160,7 +168,8 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "Domain",
-   "options": "Email Domain"
+   "options": "Email Domain",
+   "search_index": 1
   },
   {
    "depends_on": "eval:!doc.domain",
@@ -257,7 +266,7 @@
   {
    "default": "250",
    "depends_on": "use_imap",
-   "description": "Total number of emails to sync in initial sync process ",
+   "description": "Total number of emails to sync in initial sync process",
    "fieldname": "initial_sync_count",
    "fieldtype": "Select",
    "hide_days": 1,
@@ -497,7 +506,7 @@
   },
   {
    "default": "0",
-   "description": "For more information, <a class=\"text-muted\" href=\"https://erpnext.com/docs/user/manual/en/setting-up/email/linking-emails-to-document\">click here</a>.",
+   "documentation_url": "https://docs.frappe.io/erpnext/user/manual/en/linking-emails-to-document",
    "fieldname": "enable_automatic_linking",
    "fieldtype": "Check",
    "hide_days": 1,
@@ -662,12 +671,6 @@
    "fieldtype": "Column Break"
   },
   {
-   "depends_on": "eval: doc.service == \"Frappe Mail\"",
-   "fieldname": "last_synced_at",
-   "fieldtype": "Datetime",
-   "label": "Last Synced At"
-  },
-  {
    "depends_on": "eval: (doc.service == \"Frappe Mail\" && doc.auth_method != \"Basic\" && !doc.__islocal && !doc.__unsaved)",
    "fieldname": "validate_frappe_mail_settings",
    "fieldtype": "Button",
@@ -707,13 +710,65 @@
    "fieldtype": "Data",
    "label": "Always BCC Address",
    "options": "Email"
+  },
+  {
+   "depends_on": "eval: doc.service == \"Frappe Mail\"",
+   "fieldname": "last_received_at",
+   "fieldtype": "Datetime",
+   "label": "Last Received At"
+  },
+  {
+   "default": "1",
+   "fieldname": "add_x_original_from",
+   "fieldtype": "Check",
+   "label": "Add X-Original-From header"
+  },
+  {
+   "default": "1",
+   "fieldname": "add_reply_to_header",
+   "fieldtype": "Check",
+   "label": "Add Reply-To header"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "headers_section",
+   "fieldtype": "Section Break",
+   "label": "Headers"
+  },
+  {
+   "fieldname": "section_break_jdoz",
+   "fieldtype": "Section Break"
+  },
+  {
+   "fieldname": "column_break_wojv",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "column_break_mcbu",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "eval: doc.add_reply_to_header",
+   "description": "Addresses added here will be used as the Reply-To header for outgoing emails sent from this account.",
+   "fieldname": "reply_to_addresses",
+   "fieldtype": "Table",
+   "ignore_xss_filter": 1,
+   "label": "Reply-To Addresses",
+   "options": "Reply To Address"
+  },
+  {
+   "description": "Select which delivery events should trigger a delivery status notification (DSN) from the SMTP server.",
+   "fieldname": "dsn_notify_type",
+   "fieldtype": "Select",
+   "label": "Delivery Status Notification Type",
+   "options": "\nSUCCESS\nFAILURE\nDELAY\nSUCCESS,FAILURE\nSUCCESS,FAILURE,DELAY\nNEVER"
   }
  ],
  "icon": "fa fa-inbox",
  "index_web_pages_for_search": 1,
  "links": [],
  "make_attachments_public": 1,
- "modified": "2025-03-10 14:22:11.021118",
+ "modified": "2026-08-21 23:24:23.931446",
  "modified_by": "Administrator",
  "module": "Email",
  "name": "Email Account",
@@ -730,6 +785,10 @@
   {
    "read": 1,
    "role": "Inbox User"
+  },
+  {
+   "role": "Report Manager",
+   "select": 1
   }
  ],
  "row_format": "Dynamic",

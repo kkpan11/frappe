@@ -1,10 +1,11 @@
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
+from datetime import timedelta
 
 import frappe
 from frappe import _, msgprint
 from frappe.utils import cint, cstr, get_url, now_datetime
-from frappe.utils.data import getdate
+from frappe.utils.data import add_to_date, getdate
 from frappe.utils.verified_command import get_signed_params, verify_request
 
 # After this percent of failures in every batch, entire batch is aborted.
@@ -48,10 +49,10 @@ def get_emails_sent_today(email_account=None):
 		WHERE
 			`status` in ('Sent', 'Not Sent', 'Sending')
 			AND
-			`creation` > (NOW() - INTERVAL '24' HOUR)
+			`creation` > %(since)s
 	"""
 
-	q_args = {}
+	q_args = {"since": add_to_date(now_datetime(), hours=-24)}
 	if email_account is not None:
 		if email_account:
 			q += " AND email_account = %(email_account)s"
@@ -93,9 +94,9 @@ def get_unsubcribed_url(reference_doctype, reference_name, email, unsubscribe_me
 
 
 @frappe.whitelist(allow_guest=True)
-def unsubscribe(doctype, name, email):
+def unsubscribe(doctype: str, name: str, email: str):
 	# unsubsribe from comments and communications
-	if not frappe.flags.in_test and not verify_request():
+	if not frappe.in_test and not verify_request():
 		return
 
 	try:
@@ -146,7 +147,7 @@ def flush():
 	failed_email_queues = []
 	for row in email_queue_batch:
 		try:
-			email_queue: EmailQueue = frappe.get_doc("Email Queue", row.name)
+			email_queue: EmailQueue = frappe.get_doc("Email Queue", row.name, for_update=True)
 			email_queue.send()
 		except Exception:
 			frappe.get_doc("Email Queue", row.name).log_error()
@@ -162,18 +163,46 @@ def flush():
 
 def get_queue():
 	batch_size = cint(frappe.conf.email_queue_batch_size) or 500
+	undo_window = add_to_date(now_datetime(), seconds=-10)
 
 	return frappe.db.sql(
-		f"""select
+		"""select
 			name, sender
 		from
 			`tabEmail Queue`
 		where
 			(status='Not Sent' or status='Partially Sent') and
-			(send_after is null or send_after < %(now)s)
+			(send_after is null or send_after < %(now)s) and
+			(creation < %(undo_window)s)
 		order
 			by priority desc, retry asc, creation asc
-		limit {batch_size}""",
-		{"now": now_datetime()},
+		limit %(batch_size)s""",
+		{"now": now_datetime(), "undo_window": undo_window, "batch_size": batch_size},
 		as_dict=True,
 	)
+
+
+def retry_sending_emails():
+	from frappe.email.doctype.email_queue.email_queue import get_email_retry_limit
+
+	emails_in_sending = frappe.get_all(
+		"Email Queue", filters={"status": "Sending"}, fields=["name", "modified"]
+	)
+	for e in emails_in_sending:
+		if now_datetime() - e["modified"] > timedelta(minutes=15):
+			update_fields = {}
+			email_queue = frappe.get_doc("Email Queue", e["name"])
+			sent_to_atleast_one_recipient = any(
+				rec.recipient for rec in email_queue.recipients if rec.is_mail_sent()
+			)
+			if email_queue.retry < get_email_retry_limit():
+				update_fields.update(
+					{
+						"status": "Partially Sent" if sent_to_atleast_one_recipient else "Not Sent",
+						"retry": email_queue.retry + 1,
+					}
+				)
+			else:
+				update_fields.update({"status": "Error"})
+				update_fields.update({"error": "Retry Limit Exceeded"})
+			email_queue.update_status(**update_fields, commit=True)

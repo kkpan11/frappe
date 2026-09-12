@@ -1,7 +1,7 @@
 context.skip("Form Tour", () => {
 	before(() => {
 		cy.login();
-		cy.visit("/app");
+		cy.visit("/desk");
 		return cy
 			.window()
 			.its("frappe")
@@ -11,11 +11,10 @@ context.skip("Form Tour", () => {
 	});
 
 	const open_test_form_tour = () => {
-		cy.visit("/app/form-tour/Test Form Tour");
+		cy.visit("/desk/form-tour/Test Form Tour");
 		cy.findByRole("button", { name: "Show Tour" }).should("be.visible").as("show_tour");
 		cy.get("@show_tour").click();
-		cy.wait(500);
-		cy.url().should("include", "/app/contact");
+		cy.url().should("include", "/desk/contact");
 	};
 
 	it("jump to a form tour", open_test_form_tour);
@@ -30,7 +29,6 @@ context.skip("Form Tour", () => {
 
 		// next btn shouldn't move to next step, if first name is not entered
 		cy.get("@next_btn").click();
-		cy.wait(500);
 		cy.get("@first_name").should("have.class", "driver-highlighted-element");
 
 		// after filling the field, next step should be highlighted
@@ -84,11 +82,9 @@ context.skip("Form Tour", () => {
 		cy.wait(500);
 		// collapse row
 		cy.get(".grid-row-open .grid-collapse-row").click();
-		cy.wait(500);
 
 		// assert save btn is highlighted
 		cy.get(".primary-action").should("have.class", "driver-highlighted-element");
-		cy.wait(500);
 		cy.get(".frappe-driver").findByRole("button", { name: "Save" }).should("be.visible");
 	});
 });

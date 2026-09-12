@@ -4,6 +4,7 @@ export default class Widget {
 	constructor(opts) {
 		Object.assign(this, opts);
 		this.make();
+		this.apply_hidden_state();
 	}
 
 	refresh() {
@@ -27,7 +28,7 @@ export default class Widget {
 
 		options.allow_sorting &&
 			frappe.utils.add_custom_button(
-				frappe.utils.icon("es-line-drag", "xs"),
+				frappe.utils.icon("grip-vertical", "xs"),
 				null,
 				"drag-handle",
 				__("Drag"),
@@ -42,10 +43,10 @@ export default class Widget {
 				this.title_field.css("opacity", 0.5);
 				this.footer.css("opacity", 0.5);
 			}
-			const classname = this.hidden ? "fa fa-eye" : "fa fa-eye-slash";
+			const icon_html = frappe.utils.icon(this.hidden ? "eye" : "eye-off", "sm");
 			const title = this.hidden ? __("Show") : __("Hide");
 			frappe.utils.add_custom_button(
-				`<i class="${classname}" aria-hidden="true"></i>`,
+				icon_html,
 				() => this.hide_or_show(),
 				"show-or-hide-button",
 				title,
@@ -58,7 +59,7 @@ export default class Widget {
 
 		options.allow_edit &&
 			frappe.utils.add_custom_button(
-				frappe.utils.icon("es-line-edit-alt", "xs"),
+				frappe.utils.icon("pencil", "xs"),
 				() => this.edit(),
 				"edit-button",
 				__("Edit"),
@@ -108,6 +109,8 @@ export default class Widget {
 	}
 
 	delete(animate = true, dismissed = false) {
+		this.destroy();
+
 		let remove_widget = (setup_new) => {
 			this.widget.remove();
 			!dismissed && this.options.on_delete && this.options.on_delete(this.name, setup_new);
@@ -174,10 +177,10 @@ export default class Widget {
 		}
 		this.show_or_hide_button.empty();
 
-		const classname = this.hidden ? "fa fa-eye" : "fa fa-eye-slash";
+		const icon_html = frappe.utils.icon(this.hidden ? "eye" : "eye-off", "sm");
 		const title = this.hidden ? __("Show") : __("Hide");
 
-		$(`<i class="${classname}" aria-hidden="true" title="${title}"></i>`).appendTo(
+		$(`<span aria-hidden="true" title="${title}">${icon_html}</span>`).appendTo(
 			this.show_or_hide_button
 		);
 	}
@@ -196,5 +199,17 @@ export default class Widget {
 
 	set_footer() {
 		//
+	}
+
+	// Runs before the widget's node goes, for a widget that holds something the
+	// node alone does not release. Whoever removes a widget calls it.
+	destroy() {
+		//
+	}
+
+	apply_hidden_state() {
+		const is_hidden = Boolean(this.hidden);
+		const show_for_customize = is_hidden && this.in_customize_mode;
+		this.widget.toggleClass("hidden", is_hidden && !show_for_customize);
 	}
 }

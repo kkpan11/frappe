@@ -11,6 +11,8 @@ from frappe.website.utils import get_boot_data
 
 
 class WebsiteSettings(Document):
+	_DOCTYPE_NAME = "Website Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -19,9 +21,7 @@ class WebsiteSettings(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 		from frappe.website.doctype.top_bar_item.top_bar_item import TopBarItem
-		from frappe.website.doctype.website_route_redirect.website_route_redirect import (
-			WebsiteRouteRedirect,
-		)
+		from frappe.website.doctype.website_route_redirect.website_route_redirect import WebsiteRouteRedirect
 
 		address: DF.SmallText | None
 		app_logo: DF.AttachImage | None
@@ -50,6 +50,7 @@ class WebsiteSettings(Document):
 		home_page: DF.Data | None
 		indexing_authorization_code: DF.Data | None
 		indexing_refresh_token: DF.Data | None
+		max_signups_per_minute: DF.Int
 		navbar_search: DF.Check
 		navbar_template: DF.Link | None
 		navbar_template_values: DF.Code | None
@@ -179,7 +180,7 @@ def get_website_settings(context=None):
 			"footer_items": modify_header_footer_items(settings.footer_items),
 			"post_login": [
 				{"label": _("My Account"), "url": "/me"},
-				{"label": _("Log out"), "url": "/?cmd=web_logout"},
+				{"label": _("Log out"), "url": "/logout"},
 			],
 		}
 	)

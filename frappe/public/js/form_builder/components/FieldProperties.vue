@@ -9,8 +9,30 @@ let store = useStore();
 let search_text = ref("");
 let args = ref({});
 
+const LAYOUT_OVERRIDE_PROPS = new Set([
+	"label",
+	"hidden",
+	"reqd",
+	"read_only",
+	"default",
+	"description",
+	"depends_on",
+	"mandatory_depends_on",
+	"read_only_depends_on",
+	"bold",
+	"allow_in_quick_entry",
+	"in_list_view",
+	"in_standard_filter",
+	"translatable",
+]);
+
 let docfield_df = computed(() => {
 	let fields = store.get_docfields.filter((df) => {
+		// Layout mode: only show overrideable properties
+		if (store.is_layout_form && !LAYOUT_OVERRIDE_PROPS.has(df.fieldname)) {
+			return false;
+		}
+
 		if (in_list(frappe.model.layout_fields, df.fieldtype) || df.hidden) {
 			return false;
 		}
@@ -41,7 +63,11 @@ let docfield_df = computed(() => {
 			df.options = "";
 			args.value = {};
 
-			if (["Table", "Link"].includes(store.form.selected_field.fieldtype)) {
+			if (
+				["Table MultiSelect", "Table", "Link"].includes(
+					store.form.selected_field.fieldtype
+				)
+			) {
 				df.fieldtype = "Link";
 				df.options = "DocType";
 
@@ -49,11 +75,22 @@ let docfield_df = computed(() => {
 					args.value.is_table_field = 1;
 				}
 			}
-		}
+			if (
+				store.form.selected_field.fieldtype === "Data" &&
+				!store.form.selected_field.is_virtual
+			) {
+				df.fieldtype = "Select";
+				df.options = ["", "Email", "Name", "Phone", "URL", "Barcode", "IBAN"];
+			}
 
-		// show link_filters docfield only when link field is selected
-		if (df.fieldname === "link_filters" && store.form.selected_field.fieldtype !== "Link") {
-			return false;
+			const FIELD_DESCRIPTIONS = {
+				Select: __("Enter list of Options, each on a new line."),
+				Currency: __(
+					"Enter the fieldname of the currency field or a cached value (e.g. Company:company:default_currency)."
+				),
+			};
+			const fieldtype = store.form.selected_field?.fieldtype;
+			df.description = FIELD_DESCRIPTIONS[fieldtype] || "";
 		}
 
 		if (search_text.value) {
@@ -79,7 +116,7 @@ let docfield_df = computed(() => {
 			:title="__('Close properties')"
 			@click="store.form.selected_field = null"
 		>
-			<div v-html="frappe.utils.icon('remove', 'sm')"></div>
+			<div v-html="frappe.utils.icon('x', 'sm')"></div>
 		</button>
 	</div>
 	<div class="control-data">

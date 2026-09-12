@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class CommunicationLink(Document):
+	_DOCTYPE_NAME = "Communication Link"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -14,6 +16,7 @@ class CommunicationLink(Document):
 	if TYPE_CHECKING:
 		from frappe.types import DF
 
+		communication_date: DF.Datetime | None
 		link_doctype: DF.Link
 		link_name: DF.DynamicLink
 		link_title: DF.ReadOnly | None
@@ -27,3 +30,4 @@ class CommunicationLink(Document):
 
 def on_doctype_update():
 	frappe.db.add_index("Communication Link", ["link_doctype", "link_name"])
+	frappe.db.add_index("Communication Link", ["link_doctype", "link_name", "communication_date", "parent"])

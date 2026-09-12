@@ -6,24 +6,28 @@ import io
 import mimetypes
 import os
 import subprocess
+from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlparse
 
-import cssutils
 import pdfkit
+import pdfkit.api
+from pdfkit.pdfkit import PDFKit as OriginalPDFKit
 
 pdfkit.source.unicode = str  # NOTE: upstream bug; PYTHONOPTIMIZE=1 optimized this away
-from bs4 import BeautifulSoup
 from packaging.version import Version
-from pypdf import PdfReader, PdfWriter
 
 import frappe
 from frappe import _
 from frappe.core.doctype.file.utils import find_file_by_url
 from frappe.utils import cstr, scrub_urls
 from frappe.utils.caching import redis_cache
+from frappe.utils.data import get_url
 from frappe.utils.jinja_globals import bundled_asset, is_rtl
 
-cssutils.log.setLog(frappe.logger("cssutils"))
+if TYPE_CHECKING:
+	import cssutils
+	from bs4 import BeautifulSoup
+	from pypdf import PdfWriter
 
 PDF_CONTENT_ERRORS = [
 	"ContentNotFoundError",
@@ -31,6 +35,23 @@ PDF_CONTENT_ERRORS = [
 	"UnknownContentError",
 	"RemoteHostClosedError",
 ]
+
+
+class FrappePDFKit(OriginalPDFKit):
+	def _find_options_in_meta(self, content):
+		"""Override to disable meta tag parsing.
+
+		Returns an empty dict to prevent any wkhtmltopdf options from being
+		extracted from HTML meta tags. Only options passed explicitly to the
+		function should be used.
+		"""
+		return {}
+
+
+# Replace PDFKit in all relevant modules
+pdfkit.PDFKit = FrappePDFKit
+pdfkit.pdfkit.PDFKit = FrappePDFKit
+pdfkit.api.PDFKit = FrappePDFKit
 
 
 def pdf_header_html(soup, head, content, styles, html_id, css, path=None):
@@ -57,7 +78,7 @@ def pdf_body_html(template, args, **kwargs):
 		# Guess line number ?
 		frappe.throw(
 			_("Error in print format on line {0}: {1}").format(
-				_guess_template_error_line_number(template), e
+				_guess_template_error_line_number(template), str(e)
 			),
 			exc=frappe.PrintFormatError,
 			title=_("Print Format Error"),
@@ -83,19 +104,26 @@ def pdf_footer_html(soup, head, content, styles, html_id, css, path=None):
 	)
 
 
-def get_pdf(html, options=None, output: PdfWriter | None = None):
+def get_pdf(html, options=None, output: "PdfWriter" | None = None, smart_shrinking: bool = False):
+	"""Render `html` to PDF.
+
+	:param smart_shrinking: scale content that is wider than the page down to fit it, instead of
+	        clipping the overflow.
+	"""
 	html = scrub_urls(html)
 	html, options = prepare_options(html, options)
 
 	options.update({"disable-javascript": "", "disable-local-file-access": ""})
 
 	filedata = ""
-	if Version(get_wkhtmltopdf_version()) > Version("0.12.3"):
+	if not smart_shrinking and Version(get_wkhtmltopdf_version()) > Version("0.12.3"):
 		options.update({"disable-smart-shrinking": ""})
 
 	try:
 		# Set filename property to false, so no file is actually created
 		filedata = pdfkit.from_string(html, options=options or {}, verbose=True)
+
+		from pypdf import PdfReader, PdfWriter
 
 		# create in-memory binary streams from filedata and create a PdfReader object
 		reader = PdfReader(io.BytesIO(filedata))
@@ -129,6 +157,41 @@ def get_pdf(html, options=None, output: PdfWriter | None = None):
 	filedata = get_file_data_from_writer(writer)
 
 	return filedata
+
+
+def measure_time(func):
+	import time
+
+	def wrapper(*args, **kwargs):
+		start_time = time.time()
+		result = func(*args, **kwargs)
+		end_time = time.time()
+		if frappe.conf.developer_mode:
+			print(f"Function {func.__name__} took {end_time - start_time:.4f} seconds")
+		return result
+
+	return wrapper
+
+
+@measure_time
+def get_chrome_pdf(print_format, html, options, output, pdf_generator=None):
+	from frappe.utils.chromium import ChromiumManager
+	from frappe.utils.pdf_generator.browser import Browser
+	from frappe.utils.pdf_generator.pdf_merge import PDFTransformer
+
+	if pdf_generator != "chrome":
+		# Use the default pdf generator
+		return
+	# scrubbing url to expand url is not required as we have set url.
+	# also, planning to remove network requests anyway 🤞
+	generator, token = ChromiumManager.acquire()
+	try:
+		browser = Browser(generator, print_format, html, options)
+		transformer = PDFTransformer(browser)
+		# transforms and merges header, footer into body pdf and returns merged pdf
+		return transformer.transform_pdf(output=output)
+	finally:
+		generator.release(token)
 
 
 def get_file_data_from_writer(writer_obj):
@@ -209,6 +272,8 @@ def get_cookie_options():
 
 def read_options_from_html(html):
 	options = {}
+	from bs4 import BeautifulSoup
+
 	soup = BeautifulSoup(html, "html5lib")
 
 	options.update(prepare_header_footer(soup))
@@ -232,7 +297,7 @@ def read_options_from_html(html):
 	return str(soup), options
 
 
-def get_print_format_styles(soup: BeautifulSoup) -> list[cssutils.css.Property]:
+def get_print_format_styles(soup: "BeautifulSoup") -> list["cssutils.css.Property"]:
 	"""
 	Get styles purely on class 'print-format'.
 	Valid:
@@ -246,6 +311,10 @@ def get_print_format_styles(soup: BeautifulSoup) -> list[cssutils.css.Property]:
 	Returns:
 	[cssutils.css.Property(name='margin-top', value='50mm', priority=''), ...]
 	"""
+	import cssutils
+
+	cssutils.log.setLog(frappe.logger("cssutils"))
+
 	stylesheet = ""
 	style_tags = soup.find_all("style")
 
@@ -271,6 +340,8 @@ def get_print_format_styles(soup: BeautifulSoup) -> list[cssutils.css.Property]:
 
 
 def inline_private_images(html) -> str:
+	from bs4 import BeautifulSoup
+
 	soup = BeautifulSoup(html, "html.parser")
 	for img in soup.find_all("img"):
 		if b64 := _get_base64_image(img["src"]):
@@ -298,7 +369,7 @@ def _get_base64_image(src):
 		frappe.logger("pdf").error("Failed to convert inline images to base64", exc_info=True)
 
 
-def prepare_header_footer(soup: BeautifulSoup):
+def prepare_header_footer(soup: "BeautifulSoup"):
 	options = {}
 
 	head = soup.find("head").contents
@@ -384,3 +455,53 @@ def get_wkhtmltopdf_version():
 			pass
 
 	return wkhtmltopdf_version or "0"
+
+
+def pdf_contains_js(file_content: bytes):
+	"""
+	Check if a PDF file contains JavaScript.
+
+	Args:
+		file_content (bytes): The content of the PDF file.
+
+	Returns:
+		bool: True if the PDF contains JavaScript, False otherwise and also if the file is encrypted.
+	"""
+	from io import BytesIO
+
+	from pypdf import PdfReader, errors
+
+	reader = PdfReader(BytesIO(file_content))
+
+	def has_javascript(obj):
+		if isinstance(obj, dict):
+			for key, value in obj.items():
+				if key in ("/JS", "/JavaScript"):
+					return True
+				if has_javascript(value):
+					return True
+		elif isinstance(obj, list):
+			for item in obj:
+				if has_javascript(item):
+					return True
+		return False
+
+	root = reader.trailer.get("/Root", {})
+	if has_javascript(root):
+		return True
+
+	try:
+		for page in reader.pages:
+			if has_javascript(page):
+				return True
+	except errors.FileNotDecryptedError:
+		pass
+
+	return False
+
+
+def get_host_url():
+	if frappe.request:
+		return frappe.request.host_url
+	else:
+		return get_url() + "/"

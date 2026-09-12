@@ -7,11 +7,13 @@ from typing import TYPE_CHECKING
 import frappe
 import frappe.share
 from frappe import _dict
-from frappe.boot import get_allowed_reports
+from frappe.app_state import get_disabled_modules
 from frappe.core.doctype.domain_settings.domain_settings import get_active_modules
-from frappe.permissions import AUTOMATIC_ROLES, get_roles, get_valid_perms
+from frappe.desk.desk_views import DeskViews
+from frappe.permissions import AUTOMATIC_ROLES, get_rights, get_roles, get_valid_perms
 from frappe.query_builder import DocType, Order
 from frappe.query_builder.functions import Concat_ws
+from frappe.utils.translations import _
 
 if TYPE_CHECKING:
 	from frappe.core.doctype.user.user import User
@@ -39,9 +41,11 @@ class UserPermissions:
 		self.can_get_report = []
 		self.can_import = []
 		self.can_export = []
+		self.can_export_owner_only = []
 		self.can_print = []
 		self.can_email = []
 		self.allow_modules = []
+		self.permitted_modules = []
 		self.in_create = []
 		self.setup_user()
 
@@ -59,7 +63,7 @@ class UserPermissions:
 
 			return user
 
-		if not frappe.flags.in_install_db and not frappe.flags.in_test:
+		if not frappe.flags.in_install_db and not frappe.in_test:
 			user_doc = frappe.cache.hget("user_doc", self.name, get_user_doc)
 			if user_doc:
 				self.doc = frappe.get_doc(user_doc)
@@ -75,6 +79,7 @@ class UserPermissions:
 		self.doctype_map = {}
 
 		active_domains = frappe.get_active_domains()
+		disabled_modules = get_disabled_modules()
 		all_doctypes = frappe.get_all(
 			"DocType",
 			fields=[
@@ -89,6 +94,9 @@ class UserPermissions:
 		)
 
 		for dt in all_doctypes:
+			if dt.module in disabled_modules:
+				continue
+
 			if not dt.restrict_to_domain or (dt.restrict_to_domain in active_domains):
 				self.doctype_map[dt["name"]] = dt
 
@@ -101,9 +109,12 @@ class UserPermissions:
 			if dt not in self.perm_map:
 				self.perm_map[dt] = {}
 
-			for k in frappe.permissions.rights:
+			rights = get_rights(dt)
+			for k in rights:
 				if not self.perm_map[dt].get(k):
 					self.perm_map[dt][k] = r.get(k)
+			if r.get("export") and not r.get("if_owner"):
+				self.perm_map[dt]["export_non_owner"] = True
 
 	def build_permissions(self):
 		"""build lists of what the user can read / write / create
@@ -142,7 +153,8 @@ class UserPermissions:
 						no_list_view_link.append(dt)
 					else:
 						self.can_read.append(dt)
-
+						if dtp["module"] not in self.permitted_modules:
+							self.permitted_modules.append(dtp["module"])
 			if p.get("submit"):
 				self.can_submit.append(dt)
 
@@ -155,12 +167,14 @@ class UserPermissions:
 			if p.get("read") or p.get("write") or p.get("create"):
 				if p.get("report"):
 					self.can_get_report.append(dt)
-				for key in ("import", "export", "print", "email"):
+				for key in ("import", "print", "email"):
 					if p.get(key):
 						getattr(self, "can_" + key).append(dt)
 
 				if not dtp.get("istable"):
-					if not dtp.get("issingle") and not dtp.get("read_only"):
+					if frappe.session.user == "Administrator":
+						self.can_search.append(dt)
+					elif not dtp.get("issingle") and not dtp.get("read_only"):
 						self.can_search.append(dt)
 					if dtp.get("module") not in self.allow_modules:
 						if active_modules and dtp.get("module") not in active_modules:
@@ -168,12 +182,20 @@ class UserPermissions:
 						else:
 							self.allow_modules.append(dtp.get("module"))
 
+				if p.get("export"):
+					self.can_export.append(dt)
+					if not p.get("export_non_owner"):
+						self.can_export_owner_only.append(dt)
+
 		self.can_write += self.can_create
 		self.can_write += self.in_create
 		self.can_read += self.can_write
 
 		self.shared = frappe.get_all(
-			"DocShare", {"user": self.name, "read": 1}, distinct=True, pluck="share_doctype"
+			"DocShare",
+			{"user": self.name, "read": 1},
+			distinct=True,
+			pluck="share_doctype",
 		)
 		self.can_read = list(set(self.can_read + self.shared))
 		self.all_read += self.can_read
@@ -183,14 +205,13 @@ class UserPermissions:
 				self.can_read.remove(dt)
 
 		if "System Manager" in self.get_roles():
+			self.can_export_owner_only = []
 			self.can_import += frappe.get_all("DocType", {"allow_import": 1}, pluck="name")
 			self.can_import += frappe.get_all(
 				"Property Setter",
 				pluck="doc_type",
 				filters={"property": "allow_import", "value": "1"},
 			)
-
-		frappe.cache.hset("can_import", frappe.session.user, self.can_import)
 
 	def get_defaults(self):
 		import frappe.defaults
@@ -209,6 +230,27 @@ class UserPermissions:
 			self.build_permissions()
 		return self.can_read
 
+	def load_user_default_workspace(self):
+		"""
+		Note: ideally it should leverage existing `load_user` routine, through some specific flag aka `workspace_only` (aka ability to query only a specific attribute as required).
+		"""
+		user_data = frappe.db.get_value("User", self.name, ["default_workspace"], as_dict=True)
+		if user_data is None:
+			# NOTE: `user_data` shouldn't be None, as both "User" (as table) and "self.name" (as column) are expected to be Present always ??
+			return None
+
+		if user_data.get("default_workspace"):
+			try:
+				workspace = frappe.get_cached_doc("Workspace", user_data.default_workspace)
+				user_data.default_workspace = {
+					"name": workspace.name,
+					"public": workspace.public,
+					"title": workspace.title,
+				}
+			except frappe.DoesNotExistError:
+				user_data.default_workspace = None
+		return user_data.default_workspace
+
 	def load_user(self):
 		d = frappe.db.get_value(
 			"User",
@@ -224,6 +266,7 @@ class UserPermissions:
 				"language",
 				"last_name",
 				"mute_sounds",
+				"show_absolute_datetime_in_timeline",
 				"send_me_a_copy",
 				"user_type",
 				"onboarding_status",
@@ -236,12 +279,15 @@ class UserPermissions:
 			self.build_permissions()
 
 		if d.get("default_workspace"):
-			workspace = frappe.get_cached_doc("Workspace", d.default_workspace)
-			d.default_workspace = {
-				"name": workspace.name,
-				"public": workspace.public,
-				"title": workspace.title,
-			}
+			try:
+				workspace = frappe.get_cached_doc("Workspace", d.default_workspace)
+				d.default_workspace = {
+					"name": workspace.name,
+					"public": workspace.public,
+					"title": workspace.title,
+				}
+			except frappe.DoesNotExistError:
+				d.default_workspace = None
 
 		d.name = self.name
 		d.onboarding_status = frappe.parse_json(d.onboarding_status)
@@ -261,17 +307,20 @@ class UserPermissions:
 			"can_search",
 			"in_create",
 			"can_export",
+			"can_export_owner_only",
 			"can_import",
 			"can_print",
 			"can_email",
+			"permitted_modules",
 		):
 			d[key] = list(set(getattr(self, key)))
 
-		d.all_reports = self.get_all_reports()
+		# not `all_reports`: `DeskViews` already puts the identical dict on `bootinfo` as
+		# `allowed_reports`, and shipping it twice cost ~47 KB of every boot payload.
 		return d
 
 	def get_all_reports(self):
-		return get_allowed_reports()
+		return DeskViews.get_allowed_reports()
 
 
 def get_user_fullname(user: str) -> str:
@@ -287,9 +336,10 @@ def get_user_fullname(user: str) -> str:
 
 
 def get_fullname_and_avatar(user: str) -> _dict:
-	first_name, last_name, avatar, name = frappe.get_cached_value(
-		"User", user, ["first_name", "last_name", "user_image", "name"]
-	)
+	result = frappe.get_cached_value("User", user, ["first_name", "last_name", "user_image", "name"])
+	if result is None:
+		frappe.throw(_("User does not exist"), frappe.DoesNotExistError)
+	first_name, last_name, avatar, name = result
 	return _dict(
 		{
 			"fullname": " ".join(list(filter(None, [first_name, last_name]))),
@@ -436,3 +486,21 @@ def get_users_with_role(role: str) -> list[str]:
 		.distinct()
 		.run(pluck=True)
 	)
+
+
+def is_portal_user():
+	from frappe.utils import has_common
+
+	roles = get_portal_roles()
+	user_type = frappe.session.data.user_type
+	if user_type == "Website User" and has_common(frappe.get_roles(), roles):
+		return True
+
+
+def get_portal_roles():
+	roles = []
+	for menu_item in frappe.get_single("Portal Settings").menu:
+		if menu_item.role and menu_item.role not in roles:
+			roles.append(menu_item.role)
+
+	return roles

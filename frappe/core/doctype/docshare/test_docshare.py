@@ -4,18 +4,9 @@
 import frappe
 import frappe.share
 from frappe.automation.doctype.auto_repeat.test_auto_repeat import create_submittable_doctype
-from frappe.tests import IntegrationTestCase, UnitTestCase
+from frappe.tests import IntegrationTestCase
 
 EXTRA_TEST_RECORD_DEPENDENCIES = ["User"]
-
-
-class UnitTestDocshare(UnitTestCase):
-	"""
-	Unit tests for Docshare.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
 
 
 class TestDocShare(IntegrationTestCase):
@@ -233,3 +224,26 @@ class TestDocShare(IntegrationTestCase):
 			add,
 			{"doctype": "Event", "name": self.event.name, "assign_to": ["test1@example.com"]},
 		)
+
+	def test_cannot_share_without_permission(self):
+		"""Test that users cannot share permissions they don't have."""
+		# Users don't have write permission on Communication
+		doc = frappe.new_doc("Communication", subject="Hello World").save()
+
+		try:
+			frappe.set_user(self.user)
+
+			# Attempting to share with write permission should fail
+			self.assertRaises(
+				frappe.PermissionError,
+				frappe.share.add,
+				"Communication",
+				doc.name,
+				"test1@example.com",
+				write=1,
+			)
+
+			# Can share read
+			frappe.share.add("Communication", doc.name, "test1@example.com")
+		finally:
+			doc.delete()

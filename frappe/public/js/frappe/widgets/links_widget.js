@@ -4,7 +4,7 @@ frappe.provide("frappe.utils");
 
 export default class LinksWidget extends Widget {
 	constructor(opts) {
-		opts.icon = opts.icon || "es-line-filetype";
+		opts.icon = opts.icon || "file";
 		super(opts);
 	}
 
@@ -29,7 +29,7 @@ export default class LinksWidget extends Widget {
 		if (this.description) {
 			const description = $(`
 				<button class="btn-reset card-description-btn ml-2">
-					${frappe.utils.icon("help", "sm")}
+					${frappe.utils.icon("circle-question-mark", "sm")}
 				</button>
 			`).appendTo(this.widget.find(".widget-title"));
 
@@ -53,7 +53,7 @@ export default class LinksWidget extends Widget {
 				return "red";
 			}
 			if (item.onboard) {
-				return item.count ? "blue" : "yellow";
+				return item.count ? "blue" : "amber";
 			}
 			return "gray";
 		};
@@ -65,7 +65,7 @@ export default class LinksWidget extends Widget {
 						<div class="arrow"></div>
 						<h3 class="popover-title" style="display: none;"></h3>
 						<div class="popover-content" style="padding: 12px;">
-							<div class="small text-muted">${__("You need to create these first: ")}</div>
+							<div class="small text-muted">${__("You need to create these first:") + " "}</div>
 							<div class="small">${item.incomplete_dependencies.join(", ")}</div>
 						</div>
 					</div>`;
@@ -81,7 +81,7 @@ export default class LinksWidget extends Widget {
 			return `
 				<span class="link-content ellipsis">
 					<span class="link-text">${item.link_title}</span>
-					${frappe.utils.icon("es-line-arrow-up-right", "xs", "", "", "ml-2")}
+					${frappe.utils.icon("arrow-up-right", "xs", "", "", "ml-2")}
 				</span>
 			`;
 		};

@@ -5,6 +5,7 @@ import frappe
 from frappe.core.doctype.doctype.test_doctype import new_doctype
 from frappe.tests import IntegrationTestCase
 from frappe.tests.test_api import FrappeAPITestCase
+from frappe.tests.utils import whitelist_for_tests
 from frappe.utils.caching import redis_cache, request_cache, site_cache
 
 CACHE_TTL = 4
@@ -21,18 +22,18 @@ def request_specific_api(a: list | tuple | dict | int, b: int) -> int:
 	return a**b * todays_value
 
 
-@frappe.whitelist(allow_guest=True)
+@whitelist_for_tests(allow_guest=True)
 @site_cache
 def ping() -> str:
 	register_with_external_service(frappe.local.site)
-	return frappe.local.site
+	return "pong"
 
 
-@frappe.whitelist(allow_guest=True)
+@whitelist_for_tests(allow_guest=True)
 @site_cache(ttl=CACHE_TTL)
 def ping_with_ttl() -> str:
 	register_with_external_service(frappe.local.site)
-	return frappe.local.site
+	return "pong"
 
 
 class TestCachingUtils(IntegrationTestCase):
@@ -74,7 +75,7 @@ class TestCachingUtils(IntegrationTestCase):
 
 		# ensure single call if key is hashable
 		for arg in hashable_values:
-			external_service.call_count = 0
+			external_service.reset_mock()
 			for _ in range(2):
 				request_specific_api(arg, 13)
 
@@ -82,7 +83,7 @@ class TestCachingUtils(IntegrationTestCase):
 
 		# multiple calls if key cannot be generated
 		for arg in unhashable_values:
-			external_service.call_count = 0
+			external_service.reset_mock()
 			for _ in range(2):
 				request_specific_api(arg, 13)
 
@@ -370,3 +371,26 @@ class TestHttpCache(FrappeAPITestCase):
 		)
 		self.assertEqual(resp.cache_control.max_age, 600)
 		self.assertTrue(resp.cache_control.private)
+
+
+class TestValidColumnsCache(IntegrationTestCase):
+	def test_clear_doctype_cache(self):
+		from frappe.cache_manager import clear_doctype_cache
+
+		frappe.get_single("System Settings")
+		clear_doctype_cache("System Settings")
+		self.assertNotIn("System Settings", frappe.local.valid_columns)
+
+		frappe.get_single("System Settings")
+		self.assertIn("System Settings", frappe.local.valid_columns)
+		self.assertIsInstance(frappe.local.valid_columns["System Settings"], list)
+
+	def test_clear_cache(self):
+		from frappe.cache_manager import clear_cache
+
+		frappe.get_single("System Settings")
+		self.assertIn("System Settings", frappe.local.valid_columns)
+		self.assertIsInstance(frappe.local.valid_columns["System Settings"], list)
+
+		clear_cache()
+		self.assertEqual(frappe.local.valid_columns, {})

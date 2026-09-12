@@ -51,21 +51,21 @@ export default class OnboardingWidget extends Widget {
 		let $step = $(`<a class="onboarding-step ${status}">
 				<div class="step-title">
 					<div class="step-index step-pending">${frappe.utils.icon(
-						"es-line-success",
+						"circle-check",
 						"md",
 						"",
 						"",
 						"step-icon"
 					)}</div>
 					<div class="step-index step-skipped">${frappe.utils.icon(
-						"es-line-close-circle",
+						"circle-x",
 						"md",
 						"",
 						"--icon-stroke: var(--gray-600);",
 						"step-icon"
 					)}</div>
 					<div class="step-index step-complete">${frappe.utils.icon(
-						"es-solid-success",
+						"circle-check",
 						"md",
 						"",
 						"",
@@ -103,7 +103,7 @@ export default class OnboardingWidget extends Widget {
 			"Watch Video": (step) => this.show_video(step),
 			"Create Entry": (step) => {
 				if (step.is_complete) {
-					frappe.set_route(`/app/List/${step.reference_document}`);
+					frappe.set_route(`/desk/List/${step.reference_document}`);
 				} else {
 					if (step.show_full_form) {
 						this.create_entry(step);
@@ -146,7 +146,7 @@ export default class OnboardingWidget extends Widget {
 			if (step.action === "Create Entry") {
 				// add a secondary action to view list
 				content += `<p>
-					<a href='/app/${frappe.router.slug(step.reference_document)}'>
+					<a href='/desk/${frappe.router.slug(step.reference_document)}'>
 						${__("Show {0} List", [__(step.reference_document)])}</a>
 				</p>`;
 			}

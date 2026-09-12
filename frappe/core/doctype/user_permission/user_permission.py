@@ -2,6 +2,7 @@
 # License: MIT. See LICENSE
 
 import json
+from typing import Any
 
 import frappe
 from frappe import _
@@ -12,6 +13,8 @@ from frappe.utils import cstr
 
 
 class UserPermission(Document):
+	_DOCTYPE_NAME = "User Permission"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -85,13 +88,13 @@ def send_user_permissions(bootinfo):
 
 
 @frappe.whitelist()
-def get_user_permissions(user=None):
-	"""Get all users permissions for the user as a dict of doctype"""
-	# if this is called from client-side,
-	# user can access only his/her user permissions
-	if frappe.request and frappe.local.form_dict.cmd == "get_user_permissions":
-		user = frappe.session.user
+def get_current_user_permissions():
+	"""Return the permissions of the logged in user."""
+	return get_user_permissions(frappe.session.user)
 
+
+def get_user_permissions(user: str | None = None):
+	"""Get all users permissions for the user as a dict of doctype"""
 	if not user:
 		user = frappe.session.user
 
@@ -105,7 +108,7 @@ def get_user_permissions(user=None):
 
 	out = {}
 
-	def add_doc_to_perm(perm, doc_name, is_default):
+	def add_doc_to_perm(perm, doc_name, is_default, hide_descendants):
 		# group rules for each type
 		# for example if allow is "Customer", then build all allowed customers
 		# in a list
@@ -114,7 +117,12 @@ def get_user_permissions(user=None):
 
 		out[perm.allow].append(
 			frappe._dict(
-				{"doc": doc_name, "applicable_for": perm.get("applicable_for"), "is_default": is_default}
+				{
+					"doc": doc_name,
+					"applicable_for": perm.get("applicable_for"),
+					"is_default": is_default,
+					"hide_descendants": hide_descendants,
+				}
 			)
 		)
 
@@ -125,12 +133,12 @@ def get_user_permissions(user=None):
 			filters=dict(user=user),
 		):
 			meta = frappe.get_meta(perm.allow)
-			add_doc_to_perm(perm, perm.for_value, perm.is_default)
+			add_doc_to_perm(perm, perm.for_value, perm.is_default, perm.hide_descendants)
 
 			if meta.is_nested_set() and not perm.hide_descendants:
 				decendants = frappe.db.get_descendants(perm.allow, perm.for_value)
 				for doc in decendants:
-					add_doc_to_perm(perm, doc, False)
+					add_doc_to_perm(perm, doc, False, False)
 
 		out = frappe._dict(out)
 		frappe.cache.hset("user_permissions", user, out)
@@ -155,8 +163,11 @@ def user_permission_exists(user, allow, for_value, applicable_for=None):
 
 @frappe.whitelist()
 @frappe.validate_and_sanitize_search_inputs
-def get_applicable_for_doctype_list(doctype, txt, searchfield, start, page_len, filters):
-	linked_doctypes_map = get_linked_doctypes(doctype, True)
+def get_applicable_for_doctype_list(
+	doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict[str, Any]
+):
+	actual_doctype = filters.get("doctype")
+	linked_doctypes_map = get_linked_doctypes(actual_doctype, True)
 
 	linked_doctypes = []
 	for linked_doctype, linked_doctype_values in linked_doctypes_map.items():
@@ -165,7 +176,7 @@ def get_applicable_for_doctype_list(doctype, txt, searchfield, start, page_len, 
 		if child_doctype:
 			linked_doctypes.append(child_doctype)
 
-	linked_doctypes += [doctype]
+	linked_doctypes += [actual_doctype]
 
 	if txt:
 		linked_doctypes = [d for d in linked_doctypes if txt.lower() in d.lower()]
@@ -186,7 +197,7 @@ def get_permitted_documents(doctype):
 
 
 @frappe.whitelist()
-def check_applicable_doc_perm(user, doctype, docname):
+def check_applicable_doc_perm(user: str, doctype: str, docname: str | int):
 	frappe.only_for("System Manager")
 	applicable = []
 	doc_exists = frappe.get_all(
@@ -218,7 +229,7 @@ def check_applicable_doc_perm(user, doctype, docname):
 
 
 @frappe.whitelist()
-def clear_user_permissions(user, for_doctype):
+def clear_user_permissions(user: str, for_doctype: str):
 	frappe.only_for("System Manager")
 	total = frappe.db.count("User Permission", {"user": user, "allow": for_doctype})
 
@@ -236,7 +247,7 @@ def clear_user_permissions(user, for_doctype):
 
 
 @frappe.whitelist()
-def add_user_permissions(data):
+def add_user_permissions(data: str | dict[str, Any]):
 	"""Add and update the user permissions"""
 	frappe.only_for("System Manager")
 	if isinstance(data, str):

@@ -6,7 +6,9 @@
  "doctype": "DocType",
  "engine": "InnoDB",
  "field_order": [
+  "print_format_for",
   "doc_type",
+  "report",
   "module",
   "default_print_language",
   "column_break_3",
@@ -31,26 +33,32 @@
   "column_break_11",
   "font_size",
   "font",
+  "label_color",
+  "value_color",
   "page_number",
+  "show_label_colon",
   "css_section",
   "css",
   "custom_html_help",
   "section_break_13",
   "print_format_help",
   "format_data",
+  "draft_data",
+  "classic_format_data",
   "print_format_builder",
   "print_format_builder_beta"
  ],
  "fields": [
   {
+   "depends_on": "eval:doc.print_format_for == \"DocType\"",
    "fieldname": "doc_type",
    "fieldtype": "Link",
    "in_filter": 1,
    "in_list_view": 1,
    "in_standard_filter": 1,
    "label": "DocType",
-   "options": "DocType",
-   "reqd": 1
+   "mandatory_depends_on": "eval:doc.print_format_for == \"DocType\"",
+   "options": "DocType"
   },
   {
    "fieldname": "module",
@@ -79,16 +87,19 @@
    "oldfieldtype": "Select",
    "options": "No\nYes",
    "reqd": 1,
-   "search_index": 1
+   "search_index": 1,
+   "description": "Ship as files in an app, tracked in git. Developer mode only; duplicate to edit."
   },
   {
    "default": "0",
    "fieldname": "custom_format",
    "fieldtype": "Check",
-   "label": "Custom Format"
+   "label": "Custom Format",
+   "read_only_depends_on": "eval:doc.print_format_for===\"Report\";",
+   "description": "Write the format by hand in HTML and Jinja."
   },
   {
-   "depends_on": "custom_format",
+   "depends_on": "eval:doc.custom_format || doc.print_format_for == \"Report\"",
    "fieldname": "section_break_6",
    "fieldtype": "Section Break"
   },
@@ -102,15 +113,18 @@
   },
   {
    "default": "0",
+   "depends_on": "custom_format",
    "fieldname": "raw_printing",
    "fieldtype": "Check",
-   "label": "Raw Printing"
+   "label": "Raw Printing",
+   "description": "Send raw ESC/POS commands to a label or thermal printer."
   },
   {
    "depends_on": "eval:!doc.raw_printing",
    "fieldname": "html",
    "fieldtype": "Code",
    "label": "HTML",
+   "mandatory_depends_on": "eval: doc.custom_format",
    "oldfieldname": "html",
    "oldfieldtype": "Text Editor",
    "options": "Jinja"
@@ -121,6 +135,7 @@
    "fieldname": "raw_commands",
    "fieldtype": "Code",
    "label": "Raw Commands",
+   "mandatory_depends_on": "raw_printing",
    "options": "Jinja"
   },
   {
@@ -133,19 +148,22 @@
    "default": "0",
    "fieldname": "align_labels_right",
    "fieldtype": "Check",
-   "label": "Align Labels to the Right"
+   "label": "Align Labels to the Right",
+   "depends_on": "eval:!doc.print_format_builder_beta"
   },
   {
    "default": "0",
    "fieldname": "show_section_headings",
    "fieldtype": "Check",
-   "label": "Show Section Headings"
+   "label": "Show Section Headings",
+   "depends_on": "eval:!doc.print_format_builder_beta"
   },
   {
    "default": "0",
    "fieldname": "line_breaks",
    "fieldtype": "Check",
-   "label": "Show Line Breaks after Sections"
+   "label": "Show Line Breaks after Sections",
+   "depends_on": "eval:!doc.print_format_builder_beta"
   },
   {
    "fieldname": "column_break_11",
@@ -164,7 +182,19 @@
    "label": "Google Font"
   },
   {
-   "depends_on": "eval:!doc.raw_printing",
+   "depends_on": "eval:!doc.custom_format",
+   "fieldname": "label_color",
+   "fieldtype": "Color",
+   "label": "Label Color"
+  },
+  {
+   "depends_on": "eval:!doc.custom_format",
+   "fieldname": "value_color",
+   "fieldtype": "Color",
+   "label": "Value Color"
+  },
+  {
+   "depends_on": "eval:!doc.raw_printing && !doc.print_format_builder_beta",
    "fieldname": "css_section",
    "fieldtype": "Section Break"
   },
@@ -199,6 +229,14 @@
    "label": "Format Data"
   },
   {
+   "fieldname": "classic_format_data",
+   "fieldtype": "Code",
+   "hidden": 1,
+   "label": "Classic Format Data",
+   "no_copy": 1,
+   "read_only": 1
+  },
+  {
    "default": "0",
    "fieldname": "print_format_builder",
    "fieldtype": "Check",
@@ -217,7 +255,8 @@
    "default": "0",
    "fieldname": "print_format_builder_beta",
    "fieldtype": "Check",
-   "label": "Print Format Builder Beta"
+   "label": "Print Format Builder Beta",
+   "description": "Edit in the visual builder."
   },
   {
    "default": "15",
@@ -258,17 +297,50 @@
    "options": "Hide\nTop Left\nTop Center\nTop Right\nBottom Left\nBottom Center\nBottom Right"
   },
   {
+   "default": "0",
+   "description": "Show a colon after field labels (e.g. \"Name:\"), matching the older print style.",
+   "fieldname": "show_label_colon",
+   "fieldtype": "Check",
+   "label": "Show Colon After Field Labels"
+  },
+  {
    "default": "wkhtmltopdf",
    "fieldname": "pdf_generator",
    "fieldtype": "Select",
    "label": "PDF Generator",
-   "options": "wkhtmltopdf"
+   "options": "wkhtmltopdf\nchrome\nTypst"
+  },
+  {
+   "default": "DocType",
+   "fieldname": "print_format_for",
+   "fieldtype": "Select",
+   "label": "Print Format For",
+   "options": "DocType\nReport"
+  },
+  {
+   "depends_on": "eval:doc.print_format_for == \"Report\"",
+   "fieldname": "report",
+   "fieldtype": "Link",
+   "in_filter": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Report",
+   "mandatory_depends_on": "eval:doc.print_format_for == \"Report\"",
+   "options": "Report"
+  },
+  {
+   "fieldname": "draft_data",
+   "fieldtype": "Code",
+   "hidden": 1,
+   "label": "Draft Data",
+   "no_copy": 1,
+   "read_only": 1
   }
  ],
  "icon": "fa fa-print",
  "idx": 1,
  "links": [],
- "modified": "2025-02-14 14:49:39.181074",
+ "modified": "2026-08-13 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Printing",
  "name": "Print Format",
@@ -291,8 +363,8 @@
    "select": 1
   }
  ],
+ "row_format": "Dynamic",
  "sort_field": "creation",
  "sort_order": "DESC",
- "states": [],
- "track_changes": 1
+ "states": []
 }

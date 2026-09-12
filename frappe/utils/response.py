@@ -2,23 +2,23 @@
 # License: MIT. See LICENSE
 
 import datetime
-import decimal
-import json
+import functools
 import mimetypes
 import os
 import sys
-import uuid
 from collections.abc import Iterable
+from decimal import Decimal
 from pathlib import Path
 from re import Match
 from typing import TYPE_CHECKING
 from urllib.parse import quote
+from uuid import UUID
 
+import orjson
 import werkzeug.utils
 from werkzeug.exceptions import Forbidden, NotFound
 from werkzeug.local import LocalProxy
 from werkzeug.wrappers import Response
-from werkzeug.wsgi import wrap_file
 
 import frappe
 import frappe.model.document
@@ -26,12 +26,14 @@ import frappe.sessions
 import frappe.utils
 from frappe import _
 from frappe.core.doctype.access_log.access_log import make_access_log
-from frappe.utils import format_timedelta
+from frappe.core.doctype.file.utils import check_path_safety
+from frappe.utils import format_timedelta, orjson_dumps
 
 if TYPE_CHECKING:
 	from frappe.core.doctype.file.file import File
 
 DateOrTimeTypes = datetime.date | datetime.datetime | datetime.time
+timedelta = datetime.timedelta
 
 
 def report_error(status_code):
@@ -43,6 +45,8 @@ def report_error(status_code):
 	traceback = frappe.utils.get_traceback()
 	exc_type, exc_value, _ = sys.exc_info()
 
+	assert exc_type is not None, "report_error must be called while handling an active exception"
+
 	match get_api_version():
 		case ApiVersion.V1:
 			if allow_traceback:
@@ -52,6 +56,7 @@ def report_error(status_code):
 		case ApiVersion.V2:
 			error_log = {"type": exc_type.__name__}
 			if allow_traceback:
+				print(traceback)
 				error_log["exception"] = traceback
 			_link_error_with_message_log(error_log, exc_value, frappe.message_log)
 			frappe.local.response.errors = [error_log]
@@ -65,11 +70,13 @@ def report_error(status_code):
 def is_traceback_allowed():
 	from frappe.permissions import is_system_user
 
-	return (
-		frappe.db
-		and frappe.get_system_settings("allow_error_traceback")
-		and (not frappe.local.flags.disable_traceback or frappe._dev_server)
-		and is_system_user()
+	return frappe.db and (
+		frappe._dev_server
+		or (
+			frappe.get_system_settings("allow_error_traceback")
+			and not frappe.local.flags.disable_traceback
+			and is_system_user()
+		)
 	)
 
 
@@ -147,7 +154,7 @@ def as_json():
 		del frappe.local.response["http_status_code"]
 
 	response.mimetype = "application/json"
-	response.data = json.dumps(frappe.local.response, default=json_handler, separators=(",", ":"))
+	response.data = orjson_dumps(frappe.local.response, default=json_handler)
 	return response
 
 
@@ -155,7 +162,7 @@ def as_pdf():
 	response = Response()
 	response.mimetype = "application/pdf"
 	filename = frappe.response["filename"].encode("utf-8").decode("unicode-escape", "ignore")
-	response.headers.add("Content-Disposition", None, filename=filename)
+	response.headers.add("Content-Disposition", "inline", filename=filename)
 	response.data = frappe.response["filecontent"]
 	return response
 
@@ -165,7 +172,7 @@ def as_binary():
 	response.mimetype = "application/octet-stream"
 	filename = frappe.response["filename"]
 	filename = filename.encode("utf-8").decode("unicode-escape", "ignore")
-	response.headers.add("Content-Disposition", None, filename=filename)
+	response.headers.add("Content-Disposition", "attachment", filename=filename)
 	response.data = frappe.response["filecontent"]
 	return response
 
@@ -190,13 +197,15 @@ def _make_logs_v1():
 	if frappe.error_log and is_traceback_allowed():
 		if source := guess_exception_source(frappe.local.error_log and frappe.local.error_log[0]["exc"]):
 			response["_exc_source"] = source
-		response["exc"] = json.dumps([frappe.utils.cstr(d["exc"]) for d in frappe.local.error_log])
+		response["exc"] = orjson.dumps([frappe.utils.cstr(d["exc"]) for d in frappe.local.error_log]).decode()
 
 	if frappe.local.message_log:
-		response["_server_messages"] = json.dumps([json.dumps(d) for d in frappe.local.message_log])
+		response["_server_messages"] = orjson.dumps(
+			[orjson.dumps(d).decode() for d in frappe.local.message_log]
+		).decode()
 
-	if frappe.debug_log:
-		response["_debug_messages"] = json.dumps(frappe.local.debug_log)
+	if frappe.debug_log and is_traceback_allowed():
+		response["_debug_messages"] = orjson.dumps(frappe.local.debug_log).decode()
 
 	if frappe.flags.error_message:
 		response["_error_message"] = frappe.flags.error_message
@@ -208,7 +217,7 @@ def _make_logs_v2():
 	if frappe.local.message_log:
 		response["messages"] = frappe.local.message_log
 
-	if frappe.debug_log:
+	if frappe.debug_log and is_traceback_allowed():
 		response["debug"] = [{"message": m} for m in frappe.local.debug_log]
 
 
@@ -218,7 +227,7 @@ def json_handler(obj):
 	if isinstance(obj, DateOrTimeTypes):
 		return str(obj)
 
-	elif isinstance(obj, datetime.timedelta):
+	elif isinstance(obj, timedelta):
 		return format_timedelta(obj)
 
 	elif isinstance(obj, LocalProxy):
@@ -230,7 +239,7 @@ def json_handler(obj):
 	elif isinstance(obj, Iterable):
 		return list(obj)
 
-	elif isinstance(obj, decimal.Decimal):
+	elif isinstance(obj, Decimal):
 		return float(obj)
 
 	elif isinstance(obj, Match):
@@ -242,14 +251,13 @@ def json_handler(obj):
 	elif callable(obj):
 		return repr(obj)
 
-	elif isinstance(obj, uuid.UUID):
-		return str(obj)
-
 	elif isinstance(obj, Path):
 		return str(obj)
 
-	elif hasattr(obj, "__value__"):  # order imporant: defer to __json__ if implemented
-		return obj.__value__()
+	# orjson does this already
+	# but json_handler needs to be compatible with built-in json module also
+	elif isinstance(obj, UUID):
+		return str(obj)
 
 	else:
 		raise TypeError(f"""Object of type {type(obj)} with value of {obj!r} is not JSON serializable""")
@@ -275,6 +283,13 @@ def download_backup(path):
 			_("You need to be logged in and have System Manager Role to be able to access backups.")
 		)
 
+	filename = path.split("/backups/", 1)[1]
+	backup_path = frappe.get_site_path("private", "backups")
+	requested_path = frappe.get_site_path("private", "backups", filename)
+	is_safe = check_path_safety(base_path=backup_path, requested_path=requested_path)
+	if not is_safe:
+		frappe.throw(_("Invalid backup path"), frappe.PermissionError)
+
 	return send_private_file(path)
 
 
@@ -290,38 +305,57 @@ def download_private_file(path: str) -> Response:
 		raise Forbidden(_("You don't have permission to access this file"))
 
 	make_access_log(doctype="File", document=file.name, file_type=os.path.splitext(path)[-1][1:])
-	return send_private_file(path.split("/private", 1)[1])
+	return send_private_file(path.split("/private", 1)[1], filename=file.file_name)
 
 
-def send_private_file(path: str) -> Response:
+FORCE_DOWNLOAD_EXTENSIONS = (
+	".svg",
+	".svgz",
+	".html",
+	".htm",
+	".xhtml",
+	".xht",
+	".shtml",
+	".shtm",
+	".mhtml",
+	".mht",
+	".xml",
+	".xsl",
+	".xslt",
+	".swf",
+)
+
+
+def send_private_file(path: str, filename: str | None = None) -> Response:
 	path = os.path.join(frappe.local.conf.get("private_path", "private"), path.strip("/"))
-	filename = os.path.basename(path)
+	filename = filename or os.path.basename(path)
+
+	extension = os.path.splitext(path)[1]
+	as_attachment = extension.lower() in FORCE_DOWNLOAD_EXTENSIONS
 
 	if frappe.local.request.headers.get("X-Use-X-Accel-Redirect"):
 		path = "/protected/" + path
 		response = Response()
 		response.headers["X-Accel-Redirect"] = quote(frappe.utils.encode(path))
 		response.headers["Cache-Control"] = "private,max-age=3600,stale-while-revalidate=86400"
+		response.headers["Accept-Ranges"] = "bytes"
+		response.headers["Content-Type"] = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+		if as_attachment:
+			response.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(filename)}"
 
 	else:
 		filepath = frappe.utils.get_site_path(path)
-		try:
-			f = open(filepath, "rb")
-		except OSError:
+		if not os.path.exists(filepath):
 			raise NotFound
 
-		response = Response(wrap_file(frappe.local.request.environ, f), direct_passthrough=True)
-
-	# no need for content disposition and force download. let browser handle its opening.
-	# Except for those that can be injected with scripts.
-
-	extension = os.path.splitext(path)[1]
-	blacklist = [".svg", ".html", ".htm", ".xml"]
-
-	if extension.lower() in blacklist:
-		response.headers.add("Content-Disposition", "attachment", filename=filename)
-
-	response.mimetype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+		response = werkzeug.utils.send_file(
+			filepath,
+			environ=frappe.local.request.environ,
+			conditional=True,
+			as_attachment=as_attachment,
+			download_name=filename,
+		)
 
 	return response
 
@@ -338,3 +372,68 @@ def handle_session_stopped():
 		primary_action=None,
 	)
 	return get_response("message", http_status_code=503)
+
+
+def respond_as_web_page(
+	title,
+	html,
+	success=None,
+	http_status_code=None,
+	context=None,
+	indicator_color=None,
+	primary_action="/",
+	primary_label=None,
+	fullpage=False,
+	width=None,
+	template="message",
+):
+	"""Send response as a web page with a message rather than JSON."""
+	frappe.local.message_title = title
+	frappe.local.message = html
+	frappe.local.response["type"] = "page"
+	frappe.local.response["route"] = template
+	frappe.local.no_cache = 1
+
+	if http_status_code:
+		frappe.local.response["http_status_code"] = http_status_code
+
+	if not context:
+		context = {}
+
+	if not indicator_color:
+		if success:
+			indicator_color = "green"
+		elif http_status_code and http_status_code > 300:
+			indicator_color = "red"
+		else:
+			indicator_color = "blue"
+
+	assert indicator_color is not None, "indicator_color must be resolved by the branches above"
+	context["indicator_color"] = indicator_color
+	context["primary_label"] = primary_label
+	context["primary_action"] = primary_action
+	context["error_code"] = http_status_code
+	context["fullpage"] = fullpage
+	if width:
+		context["card_width"] = width
+
+	frappe.local.response["context"] = context
+
+
+def redirect_to_message(title, html, http_status_code=None, context=None, indicator_color=None):
+	"""Redirect to /message?id=random and show a message page."""
+	message_id = frappe.generate_hash(length=8)
+	message = {"context": context or {}, "http_status_code": http_status_code or 200}
+	message["context"].update({"header": title, "title": title, "message": html})
+
+	if indicator_color:
+		message["context"].update({"indicator_color": indicator_color})
+
+	frappe.cache.set_value(f"message_id:{message_id}", message, expires_in_sec=60)
+	location = f"/message?id={message_id}"
+
+	if not getattr(frappe.local, "is_ajax", False):
+		frappe.local.response["type"] = "redirect"
+		frappe.local.response["location"] = location
+	else:
+		return location

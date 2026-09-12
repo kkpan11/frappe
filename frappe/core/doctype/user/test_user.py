@@ -22,21 +22,16 @@ from frappe.core.doctype.user.user import (
 from frappe.desk.notifications import extract_mentions
 from frappe.frappeclient import FrappeClient
 from frappe.model.delete_doc import delete_doc
-from frappe.tests import IntegrationTestCase, UnitTestCase
+from frappe.tests import IntegrationTestCase
 from frappe.tests.classes.context_managers import change_settings
 from frappe.tests.test_api import FrappeAPITestCase
+from frappe.tests.utils import toggle_test_mode
+from frappe.tests.utils.test_capabilities import TestService, requires_test_service
 from frappe.utils import get_url
+from frappe.utils.data import orjson_dumps
+from frappe.www.login import sanitize_redirect
 
 user_module = frappe.core.doctype.user.user
-
-
-class UnitTestUser(UnitTestCase):
-	"""
-	Unit tests for User.
-	Use this class for testing individual functions and methods.
-	"""
-
-	pass
 
 
 class TestUser(IntegrationTestCase):
@@ -49,7 +44,7 @@ class TestUser(IntegrationTestCase):
 
 	@staticmethod
 	def reset_password(user) -> str:
-		link = user.reset_password()
+		link = user._reset_password()
 		return parse_qs(urlparse(link).query)["key"][0]
 
 	def test_user_type(self):
@@ -127,10 +122,6 @@ class TestUser(IntegrationTestCase):
 		)
 
 		self.assertEqual(frappe.db.get_value("User", "xxxtest@example.com"), None)
-
-		frappe.db.set_single_value("Website Settings", "_test", "_test_val")
-		self.assertEqual(frappe.db.get_value("Website Settings", None, "_test"), "_test_val")
-		self.assertEqual(frappe.db.get_value("Website Settings", "Website Settings", "_test"), "_test_val")
 
 	def test_high_permlevel_validations(self):
 		user = frappe.get_meta("User")
@@ -219,15 +210,21 @@ class TestUser(IntegrationTestCase):
 			result = test_password_strength("Eastern_43A1W")
 			self.assertEqual(result["feedback"]["password_policy_validation_passed"], True)
 
+			result = test_password_strength("xK9#mP2$vL8@qR5&wN3*zB7!cF4^hJ6%tD1(gS0)yA9-eU2_iO5+kM8=nQ4~rV7")
+			self.assertEqual(set(result), {"score", "feedback"})
+			orjson_dumps(result)
+
 			# test password strength while saving user with new password
 			user = frappe.get_doc("User", "test@example.com")
-			frappe.flags.in_test = False
-			user.new_password = "password"
-			self.assertRaises(frappe.exceptions.ValidationError, user.save)
-			user.reload()
-			user.new_password = "Eastern_43A1W"
-			user.save()
-			frappe.flags.in_test = True
+			toggle_test_mode(False)
+			try:
+				user.new_password = "password"
+				self.assertRaises(frappe.exceptions.ValidationError, user.save)
+				user.reload()
+				user.new_password = "Eastern_43A1W"
+				user.save()
+			finally:
+				toggle_test_mode(True)
 
 	def test_comment_mentions(self):
 		comment = """
@@ -289,6 +286,7 @@ class TestUser(IntegrationTestCase):
 		"""
 		self.assertListEqual(extract_mentions(comment), ["test@example.com", "test1@example.com"])
 
+	@requires_test_service(TestService.WEB_SERVER)
 	@IntegrationTestCase.change_settings("System Settings", commit=True, password_reset_limit=1)
 	def test_rate_limiting_for_reset_password(self):
 		url = get_url()
@@ -301,7 +299,7 @@ class TestUser(IntegrationTestCase):
 		c = FrappeClient(url)
 		res1 = c.session.post(url, data=data, verify=c.verify, headers=c.headers)
 		res2 = c.session.post(url, data=data, verify=c.verify, headers=c.headers)
-		self.assertEqual(res1.status_code, 404)
+		self.assertEqual(res1.status_code, 200)
 		self.assertEqual(res2.status_code, 429)
 
 	def test_user_rename(self):
@@ -323,6 +321,64 @@ class TestUser(IntegrationTestCase):
 
 		frappe.delete_doc("User", new_name)
 
+	def test_user_rename_updates_private_workspace(self):
+		old_name = "test_user_rename_ws@example.com"
+		new_name = "test_user_rename_ws_new@example.com"
+		actor_name = "test_user_rename_ws_actor@example.com"
+
+		old_workspace = f"Test Rename Workspace-{old_name}"
+		for email in (old_name, new_name, actor_name):
+			frappe.delete_doc("User", email, ignore_permissions=True, force=True)
+		if frappe.db.exists("Workspace", old_workspace):
+			frappe.delete_doc("Workspace", old_workspace, ignore_permissions=True, force=True)
+
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": old_name,
+				"enabled": 1,
+				"first_name": "_Test",
+				"new_password": "Eastern_43A1W",
+				"roles": [{"doctype": "Has Role", "parentfield": "roles", "role": "System Manager"}],
+			}
+		).insert(ignore_permissions=True, ignore_if_duplicate=True)
+
+		frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": actor_name,
+				"enabled": 1,
+				"first_name": "_Test Actor",
+				"new_password": "Eastern_43A1W",
+				"roles": [{"doctype": "Has Role", "parentfield": "roles", "role": "System Manager"}],
+			}
+		).insert(ignore_permissions=True, ignore_if_duplicate=True)
+
+		frappe.get_doc(
+			{
+				"doctype": "Workspace",
+				"title": "Test Rename Workspace",
+				"label": old_workspace,
+				"type": "Workspace",
+				"for_user": old_name,
+				"public": 0,
+				# Mandatory now: a private workspace belongs to a module like any other.
+				"module": "Core",
+				"content": "[]",
+			}
+		).insert(ignore_permissions=True)
+
+		with self.set_user(actor_name):
+			frappe.rename_doc("User", old_name, new_name)
+
+		new_workspace = f"Test Rename Workspace-{new_name}"
+		self.assertTrue(frappe.db.exists("Workspace", new_workspace))
+		self.assertEqual(frappe.db.get_value("Workspace", new_workspace, "for_user"), new_name)
+
+		frappe.delete_doc("Workspace", new_workspace, ignore_permissions=True, force=True)
+		frappe.delete_doc("User", new_name, ignore_permissions=True, force=True)
+		frappe.delete_doc("User", actor_name, ignore_permissions=True, force=True)
+
 	def test_signup(self):
 		import frappe.website.utils
 
@@ -330,23 +386,24 @@ class TestUser(IntegrationTestCase):
 		random_user_name = frappe.mock("name")
 		# disabled signup
 		with patch.object(user_module, "is_signup_disabled", return_value=True):
-			self.assertRaisesRegex(
-				frappe.exceptions.ValidationError,
-				"Sign Up is disabled",
-				sign_up,
-				random_user,
-				random_user_name,
-				"/signup",
+			self.assertTupleEqual(
+				sign_up(random_user, random_user_name, "/signup"),
+				(0, "We could not create an account with the provided details."),
 			)
 
 		self.assertTupleEqual(
 			sign_up(random_user, random_user_name, "/welcome"),
 			(1, "Please check your email for verification"),
 		)
-		self.assertEqual(frappe.cache.hget("redirect_after_login", random_user), "/welcome")
+		self.assertEqual(
+			frappe.cache.hget("redirect_after_login", random_user), sanitize_redirect("/welcome")
+		)
 
 		# re-register
-		self.assertTupleEqual(sign_up(random_user, random_user_name, "/welcome"), (0, "Already Registered"))
+		self.assertTupleEqual(
+			sign_up(random_user, random_user_name, "/welcome"),
+			(0, "We could not create an account with the provided details."),
+		)
 
 		# disabled user
 		user = frappe.get_doc("User", random_user)
@@ -354,19 +411,19 @@ class TestUser(IntegrationTestCase):
 		user.save()
 
 		self.assertTupleEqual(
-			sign_up(random_user, random_user_name, "/welcome"), (0, "Registered but disabled")
+			sign_up(random_user, random_user_name, "/welcome"),
+			(0, "We could not create an account with the provided details."),
 		)
 
 		# throttle user creation
 		with patch.object(user_module.frappe.db, "get_creation_count", return_value=301):
-			self.assertRaisesRegex(
-				frappe.exceptions.ValidationError,
-				"Throttled",
-				sign_up,
-				frappe.mock("email"),
-				random_user_name,
-				"/signup",
-			)
+			response = frappe.local.response
+			frappe.local.response = frappe._dict()
+			try:
+				self.assertIsNone(sign_up(frappe.mock("email"), random_user_name, "/signup"))
+				self.assertEqual(frappe.local.response["http_status_code"], 429)
+			finally:
+				frappe.local.response = response
 
 	@IntegrationTestCase.change_settings("System Settings", password_reset_limit=6)
 	def test_reset_password(self):
@@ -385,7 +442,7 @@ class TestUser(IntegrationTestCase):
 		frappe.set_user("testpassword@example.com")
 		test_user = frappe.get_doc("User", "testpassword@example.com")
 		key = self.reset_password(test_user)
-		self.assertEqual(update_password(new_password, key=key), "/app")
+		self.assertEqual(update_password(new_password, key=key), "/desk")
 		self.assertEqual(
 			update_password(new_password, key="wrong_key"),
 			"The reset password link has either been used before or is invalid",
@@ -422,6 +479,12 @@ class TestUser(IntegrationTestCase):
 
 		# test API endpoint
 		with patch.object(user_module.frappe, "sendmail") as sendmail:
+			from unittest.mock import MagicMock
+
+			mock_q = MagicMock()
+			mock_q.name = "test-email-queue-name"
+			mock_q.message = "Subject: Test\n\nDear User, here is your link"
+			sendmail.return_value = mock_q
 			frappe.clear_messages()
 			test_user = frappe.get_doc("User", "test2@example.com")
 			self.assertEqual(reset_password(user="test2@example.com"), None)
@@ -432,15 +495,28 @@ class TestUser(IntegrationTestCase):
 			update_password(old_password, old_password=new_password)
 			self.assertEqual(
 				frappe.message_log[0].get("message"),
-				f"Password reset instructions have been sent to {test_user.full_name}'s email",
+				"If this email is registered with us, we have sent password reset instructions to it. Please check your inbox.",
 			)
 
 		sendmail.assert_called_once()
 		self.assertEqual(sendmail.call_args[1]["recipients"], "test2@example.com")
 
-		self.assertEqual(reset_password(user="test2@example.com"), None)
-		self.assertEqual(reset_password(user="Administrator"), "not allowed")
-		self.assertEqual(reset_password(user="random"), "not found")
+		# Constant-response guarantee: every path — existing user, Administrator,
+		# and non-existent user — must return None AND enqueue the same generic
+		# message, so callers cannot distinguish between them.
+		_GENERIC_MSG = "If this email is registered with us, we have sent password reset instructions to it. Please check your inbox."
+
+		frappe.clear_messages()
+		self.assertIsNone(reset_password(user="test2@example.com"))
+		self.assertEqual(frappe.message_log[0].get("message"), _GENERIC_MSG)
+
+		frappe.clear_messages()
+		self.assertIsNone(reset_password(user="Administrator"))
+		self.assertEqual(frappe.message_log[0].get("message"), _GENERIC_MSG)
+
+		frappe.clear_messages()
+		self.assertIsNone(reset_password(user="random"))
+		self.assertEqual(frappe.message_log[0].get("message"), _GENERIC_MSG)
 
 	def test_user_onload_modules(self):
 		from frappe.desk.form.load import getdoc
@@ -453,6 +529,21 @@ class TestUser(IntegrationTestCase):
 			sorted(doc.get("__onload").get("all_modules", [])),
 			sorted(m.get("module_name") for m in get_modules_from_all_apps()),
 		)
+
+	def test_default_app(self):
+		from frappe.apps import get_default_path
+
+		with test_user(roles=["System Manager"]) as user:
+			user.default_app = "next_erp"
+			user.save()
+			self.assertFalse(user.default_app)
+
+			frappe.set_user(user.name)
+			user.db_set("default_app", "next_erp")
+			user.reload()
+			self.assertTrue(user.default_app)
+
+			get_default_path()  # defaults will also trigger hooks logic
 
 	@IntegrationTestCase.change_settings("System Settings", reset_password_link_expiry_duration=1)
 	def test_reset_password_link_expiry(self):
@@ -496,6 +587,7 @@ def test_user(
 		user.append_roles(*roles)
 		user.insert()
 		yield user
+		commit and frappe.db.commit()
 	finally:
 		user.delete(force=True, ignore_permissions=True)
 		commit and frappe.db.commit()

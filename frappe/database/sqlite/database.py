@@ -11,10 +11,20 @@ from frappe.database.database import (
 	ImplicitCommitError,
 )
 from frappe.database.sqlite.schema import SQLiteTable
+from frappe.database.utils import convert_backtick_identifiers
 from frappe.utils import get_table_name
 
 _PARAM_COMP = re.compile(r"%\([\w]*\)s")
 IMPLICIT_COMMIT_QUERY_TYPES = frozenset(("start", "alter", "drop", "create", "truncate"))
+
+
+class SequenceGeneratorLimitExceeded(sqlite3.Error):
+	"""Raised when an emulated sequence with a max_value (and no cycle) is exhausted.
+
+	SQLite has no native sequences (frappe emulates them, see
+	``frappe.database.sequence``), so unlike MariaDB/Postgres there is no driver
+	exception to reuse for this case.
+	"""
 
 
 class SQLiteExceptionUtil:
@@ -102,14 +112,16 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 	REGEX_CHARACTER = "regexp"
 	default_port = None
 	MAX_ROW_SIZE_LIMIT = None
+	SequenceGeneratorLimitExceeded = SequenceGeneratorLimitExceeded
 
 	def get_connection(self, read_only: bool = False):
 		conn = self.create_connection(read_only)
-		conn.isolation_level = None
 		conn.create_function("regexp", 2, regexp)
+		conn.create_function("regexp_replace", 3, regexp_replace)
 		pragmas = {
 			"journal_mode": "WAL",
 			"synchronous": "NORMAL",
+			"busy_timeout": 5000,  # in milliseconds
 		}
 		cursor = conn.cursor()
 		for pragma, value in pragmas.items():
@@ -136,6 +148,9 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 
 	def set_execution_timeout(self, seconds: int):
 		self.sql(f"PRAGMA busy_timeout = {int(seconds) * 1000}")
+
+	def set_session_time_zone(self, timezone: str):
+		pass
 
 	def setup_type_map(self):
 		self.db_type = "sqlite"
@@ -323,6 +338,26 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 			)"""
 		)
 
+	def create_sequence_table(self):
+		# SQLite has no native sequences; this table emulates them for
+		# autoname:autoincrement doctypes. See frappe.database.sequence.
+		from frappe.database.sequence import SQLITE_SEQUENCE_TABLE
+
+		# `declared` is 1 for sequences defined via create_sequence and 0 for rows
+		# auto-created by naming/set_next_val; it lets create_sequence adopt an
+		# implicit row without ever overwriting an explicit definition.
+		self.sql_ddl(
+			f"""CREATE TABLE IF NOT EXISTS `{SQLITE_SEQUENCE_TABLE}` (
+			`name` TEXT PRIMARY KEY,
+			`current` INTEGER NOT NULL,
+			`increment` INTEGER NOT NULL DEFAULT 1,
+			`min_value` INTEGER NOT NULL DEFAULT 1,
+			`max_value` INTEGER,
+			`cycle` INTEGER NOT NULL DEFAULT 0,
+			`declared` INTEGER NOT NULL DEFAULT 0
+			)"""
+		)
+
 	@staticmethod
 	def get_on_duplicate_update():
 		return "ON CONFLICT DO UPDATE SET "
@@ -351,13 +386,20 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 			if index_info and index_info[0]["name"] == fieldname:
 				return index
 
-	def add_index(self, doctype: str, fields: list, index_name: str | None = None):
-		"""Creates an index with given fields if not already created."""
+	def add_index(
+		self, doctype: str, fields: list, index_name: str | None = None, using=None, where=None, include=None
+	):
+		"""Creates an index with given fields if not already created.
+		`using`/`where`/`include` are postgres-only (trigram/partial/covering); a `using` kind
+		has no SQLite equivalent so it is skipped, and a plain index covers all rows regardless of
+		`where`/`include`."""
 
 		from frappe.custom.doctype.property_setter.property_setter import (
 			make_property_setter,
 		)
 
+		if using:
+			return
 		# We can't specify the length of the index in SQLite
 		fields = [re.sub(r"\(.*?\)", "", field) for field in fields]
 
@@ -441,6 +483,16 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 
 		return self._cursor.execute(query, values or ())
 
+	def log_query(self, query, query_type, values, debug):
+		# sqlite3 cursors expose no equivalent of the executed statement, so the
+		# mogrified query is what `last_query` reports. MariaDB and Postgres both
+		# publish this attribute; without it anything reading `db.last_query`
+		# (e.g. IntegrationTestCase.assertQueryCount) breaks only on SQLite.
+		mogrified_query = self.lazy_mogrify(query, values)
+		self.last_query = mogrified_query
+		self._log_query(mogrified_query, query_type, debug, query)
+		return mogrified_query
+
 	def sql(self, *args, **kwargs):
 		if args:
 			# since tuple is immutable
@@ -477,7 +529,7 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 			if not self.is_nested_transaction_error(e):
 				raise e
 
-	def commit(self):
+	def commit(self, chain=None):
 		"""Commit current transaction. Calls SQL `COMMIT`."""
 		if not self._conn:
 			self.connect()
@@ -497,7 +549,7 @@ class SQLiteDatabase(SQLiteExceptionUtil, Database):
 
 		self.after_commit.run()
 
-	def rollback(self, *, save_point=None):
+	def rollback(self, *, save_point=None, chain=None):
 		"""`ROLLBACK` current transaction. Optionally rollback to a known save_point."""
 		if not self._conn:
 			self.connect()
@@ -557,9 +609,9 @@ def modify_query(query):
 	"""
 	Modifies query according to the requirements of SQLite
 	"""
-	# Replace ` with " for definitions
+	# Replace ` with " only where a backtick delimits an identifier
 	query = str(query)
-	query = query.replace("`", '"')
+	query = convert_backtick_identifiers(query)
 	query = replace_locate_with_instr(query)
 
 	# Select from requires ""
@@ -583,3 +635,10 @@ def regexp(expr: str, item: str) -> bool:
 	Although it works in the CLI - doesn't work through python
 	"""
 	return re.search(expr, item) is not None
+
+
+def regexp_replace(item: str, pattern: str, repl: str) -> str:
+	"""
+	Define regexp_replace implementation for SQLite
+	"""
+	return re.sub(pattern, repl, item)

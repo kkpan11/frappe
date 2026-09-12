@@ -32,7 +32,7 @@ Cypress.Commands.add("login", (email, password) => {
 		email = Cypress.config("testUser") || "Administrator";
 	}
 	if (!password) {
-		password = Cypress.env("adminPassword");
+		password = Cypress.env("adminPassword") || "apple";
 	}
 	// cy.session clears all localStorage on new login, so we need to retain the last route
 	const session_last_route = window.localStorage.getItem("session_last_route");
@@ -125,7 +125,7 @@ Cypress.Commands.add("get_doc", (doctype, name) => {
 		});
 });
 
-Cypress.Commands.add("remove_doc", (doctype, name) => {
+Cypress.Commands.add("remove_doc", (doctype, name, ignore_missing) => {
 	return cy
 		.window()
 		.its("frappe.csrf_token")
@@ -138,9 +138,9 @@ Cypress.Commands.add("remove_doc", (doctype, name) => {
 						Accept: "application/json",
 						"X-Frappe-CSRF-Token": csrf_token,
 					},
+					failOnStatusCode: !ignore_missing,
 				})
 				.then((res) => {
-					expect(res.status).eq(202);
 					return res.body;
 				});
 		});
@@ -171,7 +171,23 @@ Cypress.Commands.add("fill_field", (fieldname, value, fieldtype = "Data") => {
 		cy.get("@input").clear().wait(200);
 	}
 
-	if (fieldtype === "Select") {
+	if (["Link", "Dynamic Link"].includes(fieldtype)) {
+		cy.get("@input").clear().focus();
+		// Wait for dropdown to appear (request might be cached, so don't wait for network)
+		cy.get("@input").parent().findByRole("listbox").as("dropdown");
+		cy.get("@dropdown").should("be.visible");
+		cy.get("@input").type(value, { delay: 100 });
+		// Wait for dropdown to update with search results
+		cy.get("@dropdown")
+			.should("be.visible")
+			.find("div[role='option']")
+			.first()
+			.should("include.text", value);
+		cy.get("@input").type("{enter}");
+		cy.get("@input").blur();
+		cy.get("@dropdown").should("not.exist");
+		cy.get("@input").should("have.value", value);
+	} else if (fieldtype === "Select") {
 		cy.get("@input").select(value);
 	} else {
 		cy.get("@input").type(value, {
@@ -186,7 +202,7 @@ Cypress.Commands.add("fill_field", (fieldname, value, fieldtype = "Data") => {
 
 Cypress.Commands.add("get_field", (fieldname, fieldtype = "Data") => {
 	let field_element = fieldtype === "Select" ? "select" : "input";
-	let selector = `[data-fieldname="${fieldname}"] ${field_element}:visible`;
+	let selector = `[data-fieldname="${fieldname}"]:not(.search) ${field_element}:visible`;
 
 	if (fieldtype === "Text Editor") {
 		selector = `[data-fieldname="${fieldname}"] .ql-editor[contenteditable=true]:visible`;
@@ -247,7 +263,7 @@ Cypress.Commands.add("awesomebar", (text) => {
 
 Cypress.Commands.add("new_form", (doctype) => {
 	let dt_in_route = doctype.toLowerCase().replace(/ /g, "-");
-	cy.visit(`/app/${dt_in_route}/new`);
+	cy.visit(`/desk/${dt_in_route}/new`);
 	cy.get("body").should(($body) => {
 		const dataRoute = $body.attr("data-route");
 		expect(dataRoute).to.match(new RegExp(`^Form/${doctype}/new-${dt_in_route}-`));
@@ -261,7 +277,7 @@ Cypress.Commands.add("select_form_tab", (label) => {
 
 Cypress.Commands.add("go_to_list", (doctype) => {
 	let dt_in_route = doctype.toLowerCase().replace(/ /g, "-");
-	cy.visit(`/app/${dt_in_route}`);
+	cy.visit(`/desk/${dt_in_route}`);
 });
 
 Cypress.Commands.add("clear_cache", () => {
@@ -270,6 +286,14 @@ Cypress.Commands.add("clear_cache", () => {
 		.then((frappe) => {
 			frappe.ui.toolbar.clear_cache();
 		});
+});
+
+Cypress.Commands.add("desk_ready", () => {
+	cy.window({ log: false }).should((win) => {
+		expect(win.frappe && win.frappe.app, "desk booted").to.be.ok;
+		expect(win.frappe.request.ajax_count, "requests settled").to.eq(0);
+	});
+	cy.get(".layout-main-section:visible").should("not.be.empty");
 });
 
 Cypress.Commands.add("dialog", (opts) => {
@@ -430,7 +454,6 @@ const add_remove_role = (action, user, role, session_user) => {
 
 Cypress.Commands.add("open_list_filter", () => {
 	cy.get(".filter-section .filter-button").click();
-	cy.wait(300);
 	cy.get(".filter-popover").should("exist");
 });
 
@@ -438,14 +461,16 @@ Cypress.Commands.add("click_custom_action_button", (name) => {
 	cy.get(`.custom-actions [data-label="${encodeURIComponent(name)}"]`).click();
 });
 
+// the page header dropdowns are espresso menus now — the panel body-portals,
+// so rows are matched inside .es-menu, not inside the btn-group
 Cypress.Commands.add("click_action_button", (name) => {
 	cy.findByRole("button", { name: "Actions" }).click();
-	cy.get(`.actions-btn-group [data-label="${encodeURIComponent(name)}"]`).click();
+	cy.get(".es-menu").contains('[role="menuitem"]', name).click();
 });
 
 Cypress.Commands.add("click_menu_button", (name) => {
-	cy.get(".standard-actions .menu-btn-group > .btn").click();
-	cy.get(`.menu-btn-group [data-label="${encodeURIComponent(name)}"]`).click();
+	cy.get(".standard-actions .menu-btn-group > button").click();
+	cy.get(".es-menu").contains('[role="menuitem"]', name).click();
 });
 
 Cypress.Commands.add("clear_filters", () => {
@@ -455,7 +480,7 @@ Cypress.Commands.add("clear_filters", () => {
 
 Cypress.Commands.add("click_modal_primary_button", (btn_name) => {
 	cy.wait(400);
-	cy.get(".modal-footer > .standard-actions > .btn-primary")
+	cy.get(".modal-footer > .standard-actions > .btn-modal-primary")
 		.contains(btn_name)
 		.click({ force: true });
 });

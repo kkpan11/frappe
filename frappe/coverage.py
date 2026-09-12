@@ -18,10 +18,11 @@ STANDARD_EXCLUSIONS = [
 	"*.scss",
 	"*.vue",
 	"*.html",
-	"*/test_*",
+	"*/test_*/*",
 	"*/node_modules/*",
 	"*/doctype/*/*_dashboard.py",
 	"*/patches/*",
+	"*/.github/*",
 ]
 
 # tested via commands' test suite
@@ -30,7 +31,7 @@ TESTED_VIA_CLI = [
 	"*/frappe/utils/install.py",
 	"*/frappe/utils/scheduler.py",
 	"*/frappe/utils/doctor.py",
-	"*/frappe/build.py",
+	"*/frappe/bundler.py",
 	"*/frappe/database/__init__.py",
 	"*/frappe/database/db_manager.py",
 	"*/frappe/database/**/setup_db.py",
@@ -46,6 +47,9 @@ FRAPPE_EXCLUSIONS = [
 	"*frappe/setup.py",
 	"*/doctype/*/*_dashboard.py",
 	"*/patches/*",
+	"*/frappe/database/postgres/*",
+	"*/.github/helper/ci.py",
+	"*/frappe/database/sqlite/*",
 	*TESTED_VIA_CLI,
 ]
 
@@ -78,7 +82,12 @@ class CodeCoverage:
 			if self.app == "frappe":
 				omit.extend(FRAPPE_EXCLUSIONS)
 
-			self.coverage = Coverage(source=[source_path], omit=omit, include=STANDARD_INCLUSIONS)
+			self.coverage = Coverage(
+				source=[source_path],
+				omit=omit,
+				include=STANDARD_INCLUSIONS,
+				data_suffix=True,
+			)
 			self.coverage.start()
 		return self
 

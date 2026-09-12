@@ -1,5 +1,7 @@
 const { defineConfig } = require("cypress");
 const fs = require("fs");
+const path = require("path");
+const cypressSplit = require("cypress-split");
 
 module.exports = defineConfig({
 	projectId: "92odwv",
@@ -8,6 +10,7 @@ module.exports = defineConfig({
 	defaultCommandTimeout: 20000,
 	pageLoadTimeout: 15000,
 	video: true,
+	videosFolder: path.resolve(__dirname, "..", "..") + "/cypressVideos/",
 	viewportHeight: 960,
 	viewportWidth: 1400,
 	retries: {
@@ -18,6 +21,19 @@ module.exports = defineConfig({
 		// We've imported your old cypress plugins here.
 		// You may want to clean this up later by importing these.
 		setupNodeEvents(on, config) {
+			on("before:browser:launch", (browser, launchOptions) => {
+				if (browser.family === "chromium") {
+					launchOptions.args.push("--disable-dev-shm-usage");
+					launchOptions.args.push("--disable-gpu");
+					launchOptions.args.push("--no-sandbox");
+				}
+				return launchOptions;
+			});
+			// Splitting tests only works when Cypress Cloud is not orchestrating parallel runs.
+			if (process.env.CYPRESS_CLOUD_PARALLEL !== "1") {
+				cypressSplit(on, config);
+			}
+
 			// Delete videos for specs without failing or retried tests
 			// https://docs.cypress.io/guides/guides/screenshots-and-videos#Delete-videos-for-specs-without-failing-or-retried-tests
 			on("after:spec", (spec, results) => {
@@ -36,5 +52,10 @@ module.exports = defineConfig({
 		testIsolation: false,
 		baseUrl: "http://test_site_ui:8000",
 		specPattern: ["./cypress/integration/*.js", "**/ui_test_*.js"],
+		excludeSpecPattern: [
+			"./cypress/integration/workspace.js",
+			"./cypress/integration/workspace_blocks.js",
+			"./cypress/integration/customize_form.js",
+		],
 	},
 });

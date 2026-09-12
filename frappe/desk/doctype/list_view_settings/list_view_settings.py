@@ -1,11 +1,15 @@
 # Copyright (c) 2020, Frappe Technologies and contributors
 # License: MIT. See LICENSE
 
+from typing import Any
+
 import frappe
 from frappe.model.document import Document
 
 
 class ListViewSettings(Document):
+	_DOCTYPE_NAME = "List View Settings"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -19,16 +23,19 @@ class ListViewSettings(Document):
 		disable_automatic_recency_filters: DF.Check
 		disable_comment_count: DF.Check
 		disable_count: DF.Check
+		disable_scrolling: DF.Check
 		disable_sidebar_stats: DF.Check
 		fields: DF.Code | None
-		total_fields: DF.Literal["", "4", "5", "6", "7", "8", "9", "10"]
+		show_tags: DF.Check
 	# end: auto-generated types
 
 	pass
 
 
 @frappe.whitelist()
-def save_listview_settings(doctype, listview_settings, removed_listview_fields):
+def save_listview_settings(
+	doctype: str, listview_settings: str | dict[str, Any], removed_listview_fields: str | list[str]
+):
 	listview_settings = frappe.parse_json(listview_settings)
 	removed_listview_fields = frappe.parse_json(removed_listview_fields)
 
@@ -86,7 +93,7 @@ def set_in_list_view_property(doctype, field, value):
 
 
 @frappe.whitelist()
-def get_default_listview_fields(doctype):
+def get_default_listview_fields(doctype: str):
 	meta = frappe.get_meta(doctype)
 	path = frappe.get_module_path(
 		frappe.scrub(meta.module), "doctype", frappe.scrub(meta.name), frappe.scrub(meta.name) + ".json"

@@ -49,8 +49,7 @@ def run_webhooks(doc, method):
 	if not webhooks_for_doc:
 		# no webhooks, quit
 		return
-
-	event_list = ["on_update", "after_insert", "on_submit", "on_cancel", "on_trash"]
+	event_list = ["on_update", "after_insert", "on_submit", "on_cancel", "on_trash", "on_update_after_submit"]
 
 	if not doc.flags.in_insert:
 		# value change is not applicable in insert
@@ -115,6 +114,6 @@ def flush_webhook_execution_queue():
 			"frappe.integrations.doctype.webhook.webhook.enqueue_webhook",
 			doc=instance.doc,
 			webhook=instance.webhook,
-			now=frappe.flags.in_test,
+			now=frappe.in_test,
 			queue=instance.webhook.background_jobs_queue or "default",
 		)

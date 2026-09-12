@@ -20,17 +20,24 @@
 				</div>
 
 				<div class="flex config-area">
-					<label v-if="allow_toggle_optimize" class="frappe-checkbox"
+					<label
+						v-if="allow_toggle_optimize"
+						class="frappe-checkbox"
+						id="uploader-optimize-checkbox"
 						><input
 							type="checkbox"
 							:checked="optimize"
 							@change="emit('toggle_optimize')"
 						/>{{ __("Optimize") }}</label
 					>
-					<label v-if="allow_toggle_private" class="frappe-checkbox"
+					<label
+						v-if="show_private_checkbox"
+						class="frappe-checkbox"
+						id="uploader-private-checkbox"
 						><input
 							type="checkbox"
 							:checked="file.private"
+							:disabled="!allow_toggle_private"
 							@change="emit('toggle_private')"
 						/>{{ __("Private") }}</label
 					>
@@ -45,20 +52,22 @@
 					:progress="progress"
 					:stroke="3"
 				/>
-				<div v-if="uploaded" v-html="frappe.utils.icon('solid-success', 'lg')"></div>
-				<div v-if="file.failed" v-html="frappe.utils.icon('solid-error', 'lg')"></div>
+				<div v-if="uploaded" v-html="frappe.utils.icon('circle-check', 'lg')"></div>
+				<div v-if="file.failed" v-html="frappe.utils.icon('circle-x', 'lg')"></div>
 				<div class="file-action-buttons">
 					<button
 						v-if="is_cropable"
 						class="btn btn-crop muted"
 						@click="emit('toggle_image_cropper')"
 						v-html="frappe.utils.icon('crop', 'md')"
+						:title="__('Crop')"
 					></button>
 					<button
 						v-if="!uploaded && !file.uploading && !file.failed"
 						class="btn muted"
 						@click="emit('remove')"
-						v-html="frappe.utils.icon('delete', 'md')"
+						v-html="frappe.utils.icon('x', 'md')"
+						:title="__('Remove')"
 					></button>
 				</div>
 			</div>
@@ -68,7 +77,7 @@
 				{{ file.error_message }}
 			</div>
 			<div
-				v-if="!file.private && !file.error_message"
+				v-if="!file.private && !file.error_message && !uploaded && !file.failed"
 				class="alert alert-warning mb-0"
 				role="alert"
 			>
@@ -93,6 +102,9 @@ let emit = defineEmits(["toggle_optimize", "toggle_private", "toggle_image_cropp
 const props = defineProps({
 	file: Object,
 	allow_toggle_private: {
+		default: true,
+	},
+	show_private_checkbox: {
 		default: true,
 	},
 	allow_toggle_optimize: {
@@ -127,9 +139,11 @@ let allow_toggle_optimize = computed(() => {
 		!props.file.failed
 	);
 });
-let allow_toggle_private = computed(() => {
-	return props.allow_toggle_private && !uploaded.value && !props.file.failed;
+
+let show_private_checkbox = computed(() => {
+	return !uploaded.value && !props.file.failed;
 });
+
 let is_cropable = computed(() => {
 	let croppable_types = ["image/jpeg", "image/png"];
 	return (
@@ -180,7 +194,7 @@ onMounted(() => {
 .file-preview-outline:hover {
 	background-color: var(--bg-color);
 	border-color: var(--dark-border-color);
-	border-radius: var(--border-radius);
+	border-radius: var(--radius);
 }
 
 .file-preview-outline:hover + .file-preview-outline {
@@ -188,7 +202,7 @@ onMounted(() => {
 }
 
 .file-icon {
-	border-radius: var(--border-radius);
+	border-radius: var(--radius);
 	width: 2.625rem;
 	height: 2.625rem;
 	overflow: hidden;
@@ -209,7 +223,7 @@ onMounted(() => {
 	align-items: center;
 	justify-content: center;
 	border: 1px solid var(--border-color);
-	border-radius: var(--border-radius);
+	border-radius: var(--radius);
 }
 
 .file-name {

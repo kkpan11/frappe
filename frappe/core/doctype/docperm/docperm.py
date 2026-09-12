@@ -5,6 +5,8 @@ from frappe.model.document import Document
 
 
 class DocPerm(Document):
+	_DOCTYPE_NAME = "DocPerm"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -20,6 +22,7 @@ class DocPerm(Document):
 		email: DF.Check
 		export: DF.Check
 		if_owner: DF.Check
+		mask: DF.Check
 		parent: DF.Data
 		parentfield: DF.Data
 		parenttype: DF.Data

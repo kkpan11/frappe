@@ -36,7 +36,6 @@ frappe.ui.form.Layout = class Layout {
 			this.setup_tabbed_layout();
 		}
 
-		this.setup_tab_events();
 		this.frm && this.setup_tooltip_events();
 		this.render();
 	}
@@ -90,10 +89,36 @@ frappe.ui.form.Layout = class Layout {
 	}
 
 	get_fields_from_layout() {
+		const OVERRIDE_PROPS = [
+			"hidden",
+			"reqd",
+			"read_only",
+			"bold",
+			"allow_in_quick_entry",
+			"in_list_view",
+			"in_standard_filter",
+			"default",
+			"description",
+			"depends_on",
+			"mandatory_depends_on",
+			"read_only_depends_on",
+		];
+
 		const fields = [];
 		for (let f of this.doctype_layout.fields) {
-			const docfield = copy_dict(frappe.meta.docfield_map[this.doctype][f.fieldname]);
-			docfield.label = f.label;
+			const base = frappe.meta.docfield_map[this.doctype][f.fieldname];
+			if (!base) continue;
+
+			const docfield = copy_dict(base);
+
+			docfield.label = f.label || docfield.label;
+			// truthy check: avoid overriding Check fields that default to 0
+			for (const prop of OVERRIDE_PROPS) {
+				if (f[prop]) {
+					docfield[prop] = f[prop];
+				}
+			}
+
 			fields.push(docfield);
 		}
 		return fields;
@@ -122,7 +147,7 @@ frappe.ui.form.Layout = class Layout {
 		}
 
 		// Add close button to block if not permanent
-		const close_message = $(`<div class="close-message">${frappe.utils.icon("close")}</div>`);
+		const close_message = $(`<div class="close-message">${frappe.utils.icon("x")}</div>`);
 		if (!permanent) {
 			close_message.appendTo($html);
 			close_message.on("click", () => $html.remove());
@@ -130,11 +155,15 @@ frappe.ui.form.Layout = class Layout {
 
 		// Add block color and append to parent container `form-message-container`
 		const block_color =
-			color && ["yellow", "blue", "red", "green", "orange"].includes(color) ? color : "blue";
+			color && ["yellow", "blue", "red", "green", "orange", "white"].includes(color)
+				? color
+				: "blue";
 		$html.addClass(block_color).appendTo(this.message);
 
 		// Show parent container if hidden
 		this.message.removeClass("hidden");
+
+		return $html;
 	}
 
 	render(new_fields) {
@@ -149,6 +178,7 @@ frappe.ui.form.Layout = class Layout {
 
 		if (this.is_tabbed_layout()) {
 			// add a tab without `fieldname` to avoid conflicts
+			this.add_default_tabs(fields);
 			let default_tab = {
 				label: __("Details"),
 				fieldtype: "Tab Break",
@@ -200,7 +230,7 @@ frappe.ui.form.Layout = class Layout {
 			(this.fields[0] && this.fields[0].fieldtype != "Section Break") || !this.fields.length
 		);
 	}
-
+	add_default_tabs() {}
 	no_opening_tab() {
 		return (this.fields[1] && this.fields[1].fieldtype != "Tab Break") || !this.fields.length;
 	}
@@ -246,6 +276,14 @@ frappe.ui.form.Layout = class Layout {
 	}
 
 	init_field(df, parent, render = false) {
+		if (df.mask) {
+			let masked_fields = frappe.get_meta(this.doctype).masked_fields || [];
+			if (masked_fields.includes(df.fieldname)) {
+				df.fieldtype = "Data";
+				df.read_only = 1;
+			}
+		}
+
 		const fieldobj = frappe.ui.form.make_control({
 			df: df,
 			doctype: this.doctype,
@@ -412,7 +450,8 @@ frappe.ui.form.Layout = class Layout {
 		}
 
 		const visible_tabs = this.tabs.filter((tab) => !tab.hidden);
-		if (visible_tabs && visible_tabs.length == 1) {
+		// Hide single tab only for regular forms, not for child tables
+		if (visible_tabs && visible_tabs.length == 1 && !this.is_child_table) {
 			visible_tabs[0].tab_link.toggleClass("hide show");
 		}
 		this.set_tab_as_active();
@@ -431,16 +470,27 @@ frappe.ui.form.Layout = class Layout {
 	}
 
 	set_tab_as_active() {
-		// Set active tab based on hash
+		// For child tables (grid row forms), always activate first visible tab
+		if (this.is_child_table) {
+			if (this.tabs.length) {
+				let first_visible_tab = this.tabs.find((tab) => !tab.is_hidden());
+				if (first_visible_tab && !first_visible_tab.is_active()) {
+					first_visible_tab.set_active();
+				}
+			}
+			return;
+		}
+
+		// Set active tab based on hash (for regular forms only)
 		const tab_from_hash = window.location.hash.replace("#", "");
 		const tab = this.tabs.find((tab) => tab.df.fieldname === tab_from_hash);
-		if (tab) {
+		if (tab && !tab.is_hidden()) {
 			tab.set_active();
 			return;
 		}
 
 		let frm_active_tab = this.frm?.get_active_tab?.();
-		if (frm_active_tab) {
+		if (frm_active_tab && !frm_active_tab.is_hidden()) {
 			frm_active_tab.set_active();
 		} else if (this.tabs.length) {
 			// set first tab as active when opening for first time, or new doc
@@ -482,7 +532,7 @@ frappe.ui.form.Layout = class Layout {
 					collapse = !this.evaluate_depends_on_value(df.collapsible_depends_on);
 				}
 
-				if (collapse && section.has_missing_mandatory()) {
+				if (collapse && (section.has_missing_mandatory() || section.expanded_by_user)) {
 					collapse = false;
 				}
 
@@ -493,24 +543,62 @@ frappe.ui.form.Layout = class Layout {
 
 	attach_doc_and_docfields(refresh) {
 		let me = this;
+
+		// Build once per refresh; frappe.meta returns the shared base df so we must copy.
+		const layout_row_map = {};
+		if (me.doctype_layout?.fields) {
+			for (const f of me.doctype_layout.fields) {
+				layout_row_map[f.fieldname] = f;
+			}
+		}
+		const has_layout = Object.keys(layout_row_map).length > 0;
+		const LAYOUT_OVERRIDE_PROPS = [
+			"hidden",
+			"reqd",
+			"read_only",
+			"bold",
+			"allow_in_quick_entry",
+			"in_list_view",
+			"in_standard_filter",
+			"default",
+			"description",
+			"depends_on",
+			"mandatory_depends_on",
+			"read_only_depends_on",
+		];
+
 		for (let i = 0, l = this.fields_list.length; i < l; i++) {
 			let fieldobj = this.fields_list[i];
 			if (me.doc) {
 				fieldobj.doc = me.doc;
 				fieldobj.doctype = me.doc.doctype;
 				fieldobj.docname = me.doc.name;
-				fieldobj.df =
-					frappe.meta.get_docfield(me.doc.doctype, fieldobj.df.fieldname, me.doc.name) ||
-					fieldobj.df;
+
+				const base_df = frappe.meta.get_docfield(
+					me.doc.doctype,
+					fieldobj.df.fieldname,
+					me.doc.name
+				);
+				if (base_df) {
+					if (has_layout) {
+						const fresh_df = copy_dict(base_df);
+						const layout_row = layout_row_map[fresh_df.fieldname];
+						if (layout_row) {
+							if (layout_row.label) fresh_df.label = layout_row.label;
+							for (const prop of LAYOUT_OVERRIDE_PROPS) {
+								if (layout_row[prop]) {
+									fresh_df[prop] = layout_row[prop];
+								}
+							}
+						}
+						fieldobj.df = fresh_df;
+					} else {
+						fieldobj.df = base_df;
+					}
+				}
 			}
 			refresh && fieldobj.df && fieldobj.refresh && fieldobj.refresh();
 		}
-	}
-
-	refresh_section_count() {
-		this.wrapper.find(".section-count-label:visible").each(function (i) {
-			$(this).html(i + 1);
-		});
 	}
 
 	setup_events() {
@@ -540,7 +628,9 @@ frappe.ui.form.Layout = class Layout {
 			if (tabs_content.getBoundingClientRect().top < 100) {
 				tabs_content.scrollIntoView();
 				setTimeout(() => {
-					$(".page-head").css("top", "-15px");
+					if (frappe.boot.read_only || frappe.boot.user.impersonated_by) {
+						$(".page-head").css("top", "-15px");
+					}
 					$(".form-tabs-list").removeClass("form-tabs-sticky-down");
 					$(".form-tabs-list").addClass("form-tabs-sticky-up");
 				}, 3);
@@ -700,40 +790,16 @@ frappe.ui.form.Layout = class Layout {
 			build dependants' dictionary
 		*/
 
-		let has_dep = false;
-
 		const fields = this.fields_list.concat(this.tabs);
 
-		for (let fkey in fields) {
-			let f = fields[fkey];
-			if (f.df.depends_on || f.df.mandatory_depends_on || f.df.read_only_depends_on) {
-				has_dep = true;
-				break;
-			}
-		}
-
-		if (!has_dep) return;
-
 		// show / hide based on values
-		for (let i = fields.length - 1; i >= 0; i--) {
-			let f = fields[i];
-			f.guardian_has_value = true;
+		for (const f of fields) {
 			if (f.df.depends_on) {
-				// evaluate guardian
+				const should_hide = !this.evaluate_depends_on_value(f.df.depends_on);
 
-				f.guardian_has_value = this.evaluate_depends_on_value(f.df.depends_on);
-
-				// show / hide
-				if (f.guardian_has_value) {
-					if (f.df.hidden_due_to_dependency) {
-						f.df.hidden_due_to_dependency = false;
-						f.refresh();
-					}
-				} else {
-					if (!f.df.hidden_due_to_dependency) {
-						f.df.hidden_due_to_dependency = true;
-						f.refresh();
-					}
+				if (f.df.hidden_due_to_dependency !== should_hide) {
+					f.df.hidden_due_to_dependency = should_hide;
+					f.refresh();
 				}
 			}
 
@@ -748,9 +814,13 @@ frappe.ui.form.Layout = class Layout {
 					"read_only"
 				);
 			}
-		}
 
-		this.refresh_section_count();
+			if (f.df.fieldtype === "Table") {
+				for (const row of f.grid?.grid_rows || []) {
+					row?.refresh_dependency();
+				}
+			}
+		}
 	}
 
 	set_dependant_property(condition, fieldname, property) {
@@ -804,9 +874,6 @@ frappe.ui.form.Layout = class Layout {
 		} else if (expression.substr(0, 5) == "eval:") {
 			try {
 				out = frappe.utils.eval(expression.substr(5), { doc, parent });
-				if (parent && parent.istable && expression.includes("is_submittable")) {
-					out = true;
-				}
 			} catch (e) {
 				frappe.throw(__('Invalid "depends_on" expression'));
 			}

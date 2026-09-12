@@ -40,17 +40,18 @@ frappe.ui.form.on("Web Form", {
 				__("Standard Web Forms can not be modified, duplicate the Web Form instead.")
 			);
 		}
-		render_list_settings_message(frm);
+		on_controlled_access_change(frm);
 
 		frm.trigger("set_fields");
 		frm.trigger("add_get_fields_button");
 		frm.trigger("add_publish_button");
 		frm.trigger("render_condition_table");
+		frm.trigger("render_dynamic_filters_table");
 	},
 
-	login_required: function (frm) {
-		render_list_settings_message(frm);
-	},
+	login_required: on_controlled_access_change,
+
+	key_required: on_controlled_access_change,
 
 	anonymous: function (frm) {
 		if (frm.doc.anonymous) {
@@ -59,12 +60,8 @@ frappe.ui.form.on("Web Form", {
 	},
 
 	validate: function (frm) {
-		if (!frm.doc.login_required) {
-			frm.set_value("allow_multiple", 0);
-			frm.set_value("allow_edit", 0);
-			frm.set_value("show_list", 0);
-		}
-
+		// allow_delete is hidden (depends_on allow_multiple) and would otherwise
+		// retain a stale value while server-side checks read it directly.
 		!frm.doc.allow_multiple && frm.set_value("allow_delete", 0);
 		frm.doc.allow_multiple && frm.set_value("show_list", 1);
 
@@ -118,6 +115,9 @@ frappe.ui.form.on("Web Form", {
 							read_only: df.read_only,
 							precision: df.precision,
 							depends_on: df.depends_on,
+							placeholder: df.placeholder,
+							max_length: df.length,
+							description: df.description,
 							mandatory_depends_on: df.mandatory_depends_on,
 							read_only_depends_on: df.read_only_depends_on,
 						});
@@ -132,11 +132,26 @@ frappe.ui.form.on("Web Form", {
 	set_fields(frm) {
 		let doc = frm.doc;
 
-		let update_options = (options) => {
-			[frm.fields_dict.web_form_fields.grid, frm.fields_dict.list_columns.grid].forEach(
-				(obj) => {
-					obj.update_docfield_property("fieldname", "options", options);
-				}
+		let as_select_option = (df) => ({
+			label: df.label,
+			value: df.fieldname,
+		});
+		let update_options = (fields) => {
+			frm.fields_dict.web_form_fields.grid.update_docfield_property(
+				"fieldname",
+				"options",
+				fields.map(as_select_option)
+			);
+			frm.fields_dict.list_columns.grid.update_docfield_property(
+				"fieldname",
+				"options",
+				fields
+					.filter(
+						(df) =>
+							!frappe.model.no_value_type.includes(df.fieldtype) &&
+							df.is_virtual !== 1
+					)
+					.map(as_select_option)
 			);
 		};
 
@@ -146,14 +161,12 @@ frappe.ui.form.on("Web Form", {
 			return;
 		}
 
-		update_options([`Fetching fields from ${doc.doc_type}...`]);
+		update_options([
+			{ label: __("Fetching fields from {0}...", [doc.doc_type]), fieldname: "" },
+		]);
 
 		get_fields_for_doctype(doc.doc_type).then((fields) => {
-			let as_select_option = (df) => ({
-				label: df.label,
-				value: df.fieldname,
-			});
-			update_options(fields.map(as_select_option));
+			update_options(fields);
 
 			let currency_fields = fields
 				.filter((df) => ["Currency", "Float"].includes(df.fieldtype))
@@ -161,7 +174,7 @@ frappe.ui.form.on("Web Form", {
 			if (!currency_fields.length) {
 				currency_fields = [
 					{
-						label: `No currency fields in ${doc.doc_type}`,
+						label: __("No currency fields in {0}", [doc.doc_type]),
 						value: "",
 						disabled: true,
 					},
@@ -187,9 +200,15 @@ frappe.ui.form.on("Web Form", {
 	},
 
 	before_save: function (frm) {
+		let dynamic_filters = JSON.parse(frm.doc.dynamic_filters_json || "null");
 		let static_filters = JSON.parse(frm.doc.condition_json || "[]");
+		static_filters = frappe.dashboard_utils.remove_common_static_filter_values(
+			static_filters,
+			dynamic_filters
+		);
 		frm.set_value("condition_json", JSON.stringify(static_filters));
 		frm.trigger("render_condition_table");
+		frm.trigger("render_dynamic_filters_table");
 	},
 
 	render_condition_table: function (frm) {
@@ -292,6 +311,106 @@ frappe.ui.form.on("Web Form", {
 			dialog.set_values(filters);
 		});
 	},
+	render_dynamic_filters_table(frm) {
+		let wrapper = $(frm.get_field("dynamic_filters_json").wrapper).empty();
+
+		frm.dynamic_filter_table = $(`<table class="table table-bordered" style="cursor:${
+			frm.has_perm("write") ? "pointer" : "default"
+		}; margin:0px;">
+			<thead>
+				<tr>
+					<th style="width: 20%">${__("Filter")}</th>
+					<th style="width: 20%">${__("Condition")}</th>
+					<th>${__("Value")}</th>
+				</tr>
+			</thead>
+			<tbody></tbody>
+		</table>`).appendTo(wrapper);
+
+		frm.dynamic_filters =
+			frm.doc.dynamic_filters_json && frm.doc.dynamic_filters_json.length > 2
+				? JSON.parse(frm.doc.dynamic_filters_json)
+				: null;
+
+		frm.trigger("set_dynamic_filters_in_table");
+
+		let filters = JSON.parse(frm.doc.condition_json || "[]");
+
+		let fields = frappe.dashboard_utils.get_fields_for_dynamic_filter_dialog(
+			true,
+			filters,
+			frm.dynamic_filters
+		);
+
+		// Override description to show Python expressions (evaluated server-side)
+		let desc_field = fields.find((f) => f.fieldname === "description");
+		if (desc_field) {
+			desc_field.options = `<div>
+				<p>${__("Set dynamic filter values as Python expressions.")}</p>
+				<p>${__("For example:")}
+					<code>frappe.session.user</code> ${__("or")}
+					<code>frappe.utils.now()</code>
+				</p>
+			</div>`;
+		}
+
+		frm.dynamic_filter_table.on("click", () => {
+			if (!frm.has_perm("write")) {
+				return;
+			}
+
+			if (!frappe.boot.developer_mode && frm.doc.is_standard) {
+				frappe.throw(__("Cannot edit filters for standard Web Forms"));
+			}
+			let dialog = new frappe.ui.Dialog({
+				title: __("Set Dynamic Filters"),
+				fields: fields,
+				primary_action: () => {
+					let values = dialog.get_values();
+					dialog.hide();
+					let dynamic_filters = [];
+					for (let key of Object.keys(values)) {
+						let [doctype, fieldname] = key.split(":");
+						dynamic_filters.push([doctype, fieldname, "=", values[key]]);
+					}
+					frm.set_value("dynamic_filters_json", JSON.stringify(dynamic_filters));
+					frm.trigger("set_dynamic_filters_in_table");
+				},
+				primary_action_label: __("Set"),
+			});
+
+			dialog.show();
+			if (frm.dynamic_filters) {
+				let filter_values = {};
+				frm.dynamic_filters.forEach((f) => {
+					filter_values[f[0] + ":" + f[1]] = f[3];
+				});
+				dialog.set_values(filter_values);
+			}
+		});
+	},
+	set_dynamic_filters_in_table: function (frm) {
+		frm.dynamic_filters =
+			frm.doc.dynamic_filters_json && frm.doc.dynamic_filters_json.length > 2
+				? JSON.parse(frm.doc.dynamic_filters_json)
+				: null;
+
+		if (!frm.dynamic_filters) {
+			const filter_row = $(`<tr><td colspan="3" class="text-muted text-center">
+				${__("Click to Set Dynamic Filters")}</td></tr>`);
+			frm.dynamic_filter_table.find("tbody").html(filter_row);
+		} else {
+			let filter_rows = "";
+			frm.dynamic_filters.forEach((filter) => {
+				filter_rows += `<tr>
+						<td>${filter[1]}</td>
+						<td>${filter[2] || ""}</td>
+						<td>${filter[3]}</td>
+					</tr>`;
+			});
+			frm.dynamic_filter_table.find("tbody").html(filter_rows);
+		}
+	},
 });
 
 frappe.ui.form.on("Web Form List Column", {
@@ -301,6 +420,7 @@ frappe.ui.form.on("Web Form List Column", {
 		if (!df) return;
 		doc.fieldtype = df.fieldtype;
 		doc.label = df.label;
+		doc.options = df.options;
 		frm.refresh_field("list_columns");
 	},
 });
@@ -336,7 +456,10 @@ frappe.ui.form.on("Web Form Field", {
 		doc.default = df.default;
 		doc.read_only = df.read_only;
 		doc.depends_on = df.depends_on;
+		doc.placeholder = df.placeholder;
+		doc.description = df.description;
 		doc.mandatory_depends_on = df.mandatory_depends_on;
+		doc.max_length = df.length;
 		doc.read_only_depends_on = df.read_only_depends_on;
 
 		frm.refresh_field("web_form_fields");
@@ -356,22 +479,41 @@ function get_fields_for_doctype(doctype) {
 	});
 }
 
+function on_controlled_access_change(frm) {
+	const has_controlled_access = frm.doc.login_required || frm.doc.key_required;
+	if (!has_controlled_access) {
+		frm.set_value("allow_multiple", 0);
+		frm.set_value("allow_edit", 0);
+		frm.set_value("allow_delete", 0);
+		frm.set_value("show_list", 0);
+	}
+	render_list_settings_message(frm);
+}
+
 function render_list_settings_message(frm) {
 	// render list setting message
-	if (frm.fields_dict["list_setting_message"] && !frm.doc.login_required) {
-		const go_to_login_required_field = `
-			<code class="pointer" title="${__("Go to Login Required field")}">
-				${__("login_required")}
+	if (
+		frm.fields_dict["list_setting_message"] &&
+		!frm.doc.login_required &&
+		!frm.doc.key_required
+	) {
+		const go_to_access_fields = `
+			<code class="pointer" title="${__("Go to Access Control section")}">
+				${__("Login Required")}
+			</code>
+			${__("or")}
+			<code class="pointer" title="${__("Go to Access Control section")}">
+				${__("Key Required")}
 			</code>
 		`;
 		let message = __(
-			"Login is required to see web form list view. Enable {0} to see list settings",
-			[go_to_login_required_field]
+			"Login or a request key is required to see web form list view. Enable {0} to see list settings",
+			[go_to_access_fields]
 		);
 		$(frm.fields_dict["list_setting_message"].wrapper)
 			.html($(`<div class="form-message blue">${message}</div>`))
 			.find("code")
-			.click(() => frm.scroll_to_field("login_required"));
+			.click(() => frm.scroll_to_field("access_control_section"));
 	} else {
 		$(frm.fields_dict["list_setting_message"].wrapper).empty();
 	}

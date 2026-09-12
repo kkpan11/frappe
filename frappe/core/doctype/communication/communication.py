@@ -13,7 +13,7 @@ from frappe.automation.doctype.assignment_rule.assignment_rule import (
 	apply as apply_assignment_rule,
 )
 from frappe.contacts.doctype.contact.contact import get_contact_name
-from frappe.core.doctype.comment.comment import update_comment_in_doc
+from frappe.core.doctype.comment.comment import relink_comment_cache
 from frappe.core.doctype.communication.email import validate_email
 from frappe.core.doctype.communication.mixins import CommunicationEmailMixin
 from frappe.core.utils import get_parent_doc
@@ -32,6 +32,8 @@ exclude_from_linked_with = True
 
 
 class Communication(Document, CommunicationEmailMixin):
+	_DOCTYPE_NAME = "Communication"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -230,7 +232,7 @@ class Communication(Document, CommunicationEmailMixin):
 		html_signature = soup.find("div", {"class": "ql-editor read-mode"})
 		_signature = None
 		if html_signature:
-			_signature = html_signature.renderContents()
+			_signature = html_signature.encode_contents()
 
 		if (cstr(_signature) or signature) not in self.content:
 			self.content = f'{self.content}</p><br><p class="signature">{signature}'
@@ -240,9 +242,16 @@ class Communication(Document, CommunicationEmailMixin):
 			self.set_signature_in_email_content()
 
 	def on_update(self):
-		# add to _comment property of the doctype, so it shows up in
-		# comments count for the list view
-		update_comment_in_doc(self)
+		"""
+		add to _comment property of the doctype, so it shows up in comments count for the list view;
+		also move the cached entry off the old parent if the reference changed (e.g. via Communication.save())
+		"""
+		before_save = self.get_doc_before_save()
+		relink_comment_cache(
+			self,
+			before_save.reference_doctype if before_save else None,
+			before_save.reference_name if before_save else None,
+		)
 
 		parent = get_parent_doc(self)
 		if (method := getattr(parent, "on_communication_update", None)) and callable(method):
@@ -401,7 +410,13 @@ class Communication(Document, CommunicationEmailMixin):
 			return
 
 		for doctype, docname in parse_email([self.recipients, self.cc, self.bcc]):
-			if not frappe.db.get_value(doctype, docname, ignore=True):
+			# Both document and doctype names should be case insensitive in email addresses.
+			doctype = frappe.db.exists("DocType", doctype, cache=True) or frappe.db.exists(
+				"DocType", frappe.unscrub(doctype), cache=True
+			)
+			if doctype:
+				docname = frappe.db.get_value(doctype, docname, ignore=True)
+			if not (doctype and docname):
 				continue
 
 			self.add_link(doctype, docname)
@@ -412,6 +427,13 @@ class Communication(Document, CommunicationEmailMixin):
 
 	# Timeline Links
 	def set_timeline_links(self):
+		# Skip timeline links if a "Sent" communication already exists
+		# else will create duplicate timeline entries
+		if self.sent_or_received == "Received" and self.find_one_by_filters(
+			message_id=self.message_id, email_account=self.email_account, sent_or_received="Sent"
+		):
+			return
+
 		contacts = []
 		create_contact_enabled = self.email_account and frappe.db.get_value(
 			"Email Account", self.email_account, "create_contact"
@@ -436,7 +458,22 @@ class Communication(Document, CommunicationEmailMixin):
 			self.add_link(doctype, name)
 
 	def add_link(self, link_doctype, link_name, autosave=False):
-		self.append("timeline_links", {"link_doctype": link_doctype, "link_name": link_name})
+		title_field = frappe.get_meta(link_doctype).get_title_field()
+		link_title = (
+			frappe.db.get_value(link_doctype, link_name, title_field, cache=True, order_by=None)
+			if title_field != "name"
+			else None
+		)
+
+		self.append(
+			"timeline_links",
+			{
+				"link_doctype": link_doctype,
+				"link_name": link_name,
+				"link_title": link_title or link_name,
+				"communication_date": self.communication_date,
+			},
+		)
 
 		if autosave:
 			self.save(ignore_permissions=True)
@@ -455,9 +492,13 @@ class Communication(Document, CommunicationEmailMixin):
 
 def on_doctype_update():
 	"""Add indexes in `tabCommunication`"""
-	frappe.db.add_index("Communication", ["reference_doctype", "reference_name"])
 	frappe.db.add_index("Communication", ["status", "communication_type"])
 	frappe.db.add_index("Communication", ["message_id(140)"])
+	frappe.db.add_index(
+		"Communication",
+		["reference_doctype", "reference_name", "communication_date", "communication_type"],
+		index_name="comm_ref_type_date_idx",
+	)
 
 
 def has_permission(doc, ptype, user=None, debug=False):
@@ -483,7 +524,10 @@ def get_permission_query_conditions_for_communication(user):
 		return None
 	else:
 		accounts = frappe.get_all(
-			"User Email", filters={"parent": user}, fields=["email_account"], distinct=True, order_by="idx"
+			"User Email",
+			filters={"parent": user},
+			fields=["email_account"],
+			distinct=True,
 		)
 
 		if not accounts:
@@ -561,11 +605,11 @@ def parse_email(email_strings):
 
 		for email in email_string.split(","):
 			local_part = email.split("@", 1)[0].strip('"')
-			user, detail = None, None
+			_user, detail = None, None
 			if "+" in local_part:
-				user, detail = local_part.split("+", 1)
+				_user, detail = local_part.split("+", 1)
 			elif "--" in local_part:
-				detail, user = local_part.rsplit("--", 1)
+				detail, _user = local_part.rsplit("--", 1)
 
 			if not detail:
 				continue
@@ -644,7 +688,10 @@ def update_first_response_time(parent, communication):
 			is_system_user(communication.sender)
 			or frappe.get_cached_value("User", frappe.session.user, "user_type") == "System User"
 		):
-			if communication.sent_or_received == "Sent":
+			if (
+				communication.sent_or_received == "Sent"
+				and communication.communication_type == "Communication"
+			):
 				first_responded_on = communication.creation
 				if parent.meta.has_field("first_responded_on"):
 					parent.db_set("first_responded_on", first_responded_on)

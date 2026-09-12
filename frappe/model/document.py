@@ -1,13 +1,17 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
+import functools
 import hashlib
+import inspect
+import itertools
 import json
 import time
-from collections.abc import Generator, Iterable
+import warnings
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
-from functools import wraps
+from functools import cached_property, wraps
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Optional, TypeAlias, Union, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Optional, Self, TypeAlias, Union, overload, override
 
 from werkzeug.exceptions import NotFound
 
@@ -15,31 +19,50 @@ import frappe
 from frappe import _, is_whitelisted, msgprint
 from frappe.core.doctype.file.utils import relink_mismatched_files
 from frappe.core.doctype.server_script.server_script_utils import run_server_script_for_doc_event
-from frappe.desk.form.document_follow import follow_document
+from frappe.database.utils import commit_after_response
+from frappe.desk.form.document_follow import _follow_document
 from frappe.integrations.doctype.webhook import run_webhooks
 from frappe.model import optional_fields, table_fields
-from frappe.model.base_document import BaseDocument, get_controller
+from frappe.model.base_document import BaseDocument, D, get_controller
 from frappe.model.docstatus import DocStatus
 from frappe.model.naming import set_new_name, validate_name
 from frappe.model.utils import is_virtual_doctype, simple_singledispatch
 from frappe.model.workflow import set_workflow_state_on_action, validate_workflow
-from frappe.types import DF, DocRef
-from frappe.utils import compare, cstr, date_diff, file_lock, flt, get_table_name, now
+from frappe.types import DF
+from frappe.types.filter import FilterSignature
+from frappe.utils import cint, compare, cstr, date_diff, file_lock, flt, get_table_name, now
 from frappe.utils.data import get_absolute_url, get_datetime, get_timedelta, getdate
 from frappe.utils.global_search import update_global_search
 
 if TYPE_CHECKING:
-	from typing_extensions import Self
+	from typing import Self
 
 	from frappe.core.doctype.docfield.docfield import DocField
 
 
-DOCUMENT_LOCK_EXPIRTY = 3 * 60 * 60  # All locks expire in 3 hours automatically
+DOCUMENT_LOCK_EXPIRY = 3 * 60 * 60  # All locks expire in 3 hours automatically
 DOCUMENT_LOCK_SOFT_EXPIRY = 30 * 60  # Let users force-unlock after 30 minutes
+_POSITIONAL_PARAM_KINDS = frozenset(
+	(inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+)
 
 
-_SingleDocument: TypeAlias = "Document"
-_NewDocument: TypeAlias = "Document"
+@functools.cache
+def _accepts_method_argument(f: Callable) -> bool:
+	"""Return True if the doc event handler expects the `method` argument."""
+	signature = inspect.signature(f)
+	kinds = [p.kind for p in signature.parameters.values()]
+	if any(kind == inspect.Parameter.VAR_POSITIONAL for kind in kinds):
+		return True
+
+	if sum(1 for kind in kinds if kind in _POSITIONAL_PARAM_KINDS) > 1:
+		return True
+
+	return False
+
+
+type _SingleDocument = "Document"
+type _NewDocument = "Document"
 
 
 @overload
@@ -54,7 +77,9 @@ def get_doc(doctype: str, /) -> _SingleDocument:
 
 
 @overload
-def get_doc(doctype: str, name: str, /, *, for_update: bool | None = None) -> "Document":
+def get_doc(
+	doctype: str, name: str, /, *, for_update: bool | None = None, check_permission: str | bool | None = None
+) -> "Document":
 	"""Retrieve DocType from DB, doctype and name must be positional argument."""
 	pass
 
@@ -104,7 +129,7 @@ def get_doc(*args, **kwargs) -> "Document":
 	if not args and kwargs:
 		return get_doc_from_dict(kwargs)
 	else:
-		raise ValueError("First non keyword argument must be a string, dict or DocRef")
+		raise ValueError("First non keyword argument must be a string or dict")
 
 
 @get_doc.register(BaseDocument)
@@ -112,17 +137,12 @@ def _basedoc(doc: BaseDocument, *args, **kwargs) -> "Document":
 	return doc
 
 
-@get_doc.register(DocRef)
-def _docref(doc_ref: DocRef, **kwargs) -> "Document":
-	return get_doc(doc_ref.doctype, doc_ref.name, **kwargs)
-
-
 @get_doc.register(str)
 def get_doc_str(doctype: str, name: str | None = None, **kwargs) -> "Document":
 	# if no name: it's a single
-	controller = get_controller(doctype)
-	if controller:
-		return controller(doctype, name, **kwargs)
+	if controller := get_controller(doctype):
+		doc = controller(doctype, name, **kwargs)
+		return get_doc_permission_check(doc, kwargs.get("check_permission"))
 
 	raise ImportError(doctype)
 
@@ -136,14 +156,294 @@ def get_doc_from_mapping_proxy(data: MappingProxyType, **kwargs) -> "Document":
 def get_doc_from_dict(data: dict[str, Any], **kwargs) -> "Document":
 	if "doctype" not in data:
 		raise ValueError('"doctype" is a required key')
-	controller = get_controller(data["doctype"])
-	if controller:
-		return controller(**data)
+	if controller := get_controller(data["doctype"]):
+		doc = controller(**data)
+		return get_doc_permission_check(doc, kwargs.get("check_permission"))
 	raise ImportError(data["doctype"])
 
 
-class Document(BaseDocument, DocRef):
+def get_lazy_doc(
+	doctype: str, name: str, *, for_update=None, check_permission: str | bool | None = None
+) -> "Document":
+	if doctype == "DocType":
+		warnings.warn("DocType doesn't support lazy loading", stacklevel=1)
+		return get_doc(doctype, name, check_permission=check_permission)
+
+	if controller := get_lazy_controller(doctype):
+		doc = controller(doctype, name, for_update=for_update)
+		return get_doc_permission_check(doc, check_permission)
+	raise ImportError(doctype)
+
+
+def get_docs(
+	doctype: str,
+	filters: dict | None = None,
+	*,
+	chunk_size: int = 1000,
+	limit: int | None = None,
+	limit_start: int = 0,
+	order_by: str = "creation asc",
+	as_iterator: bool = False,
+	for_update: bool = False,
+	distinct: bool = False,
+) -> list["Document"] | Generator["Document"]:
+	"""Fetch fully instantiated Document objects from the database.
+
+	Returns a list of Documents by default. Pass `as_iterator=True` to get
+	a chunked generator that yields a list of Documents per chunk to reduce memory usage.
+
+	:param doctype: DocType of the records to fetch.
+	:param filters: Dict or list of filters to apply.
+	:param chunk_size: Number of records to fetch in each chunk if using `as_iterator`.
+	:param limit: Maximum total number of records to fetch.
+	:param limit_start: Start results at record #. Default 0.
+	:param order_by: Order By string, e.g. `creation desc`.
+	:param as_iterator: If True, returns a iterator yielding Documents.
+	:param for_update: If True, locks the fetched rows for update.
+	:param distinct: If True, return distinct rows.
+
+
+	Note: Chunk size controls memory usage vs # of queries tradeoff. Using chunk size larger than
+	10,000 is not advisable.
+	"""
+	if is_virtual_doctype(doctype):
+		frappe.throw(_("Virtual DocType {0} cannot be fetched in bulk.").format(doctype))
+
+	meta = frappe.get_meta(doctype)
+
+	if meta.issingle:
+		frappe.throw(_("Single DocType {0} cannot be fetched in bulk.").format(doctype))
+
+	if limit_start and limit is None:
+		frappe.throw(_("limit cannot be None when limit_start is used"))
+
+	if not order_by:
+		# Sort order is mandatory for iterator logic
+		order_by = "name asc"
+
+	child_tables = [
+		(df.fieldname, df.options) for df in meta.get_table_fields() if not is_virtual_doctype(df.options)
+	]
+	controller = get_controller(doctype)
+	for_update = for_update and frappe.db.db_type != "sqlite"
+
+	iterator = _get_docs_generator(
+		doctype,
+		controller,
+		child_tables,
+		filters=filters,
+		chunk_size=chunk_size,
+		limit_start=limit_start,
+		order_by=order_by,
+		for_update=for_update,
+		distinct=distinct,
+	)
+
+	iterator = itertools.islice(iterator, limit)
+
+	if as_iterator:
+		return iterator
+	return list(iterator)
+
+
+def _get_docs_generator(
+	doctype,
+	controller,
+	child_tables,
+	*,
+	filters,
+	chunk_size,
+	limit_start,
+	order_by,
+	for_update,
+	distinct,
+) -> Generator["Document"]:
+	offset = limit_start
+
+	while True:
+		chunk_data = _fetch_rows(
+			doctype,
+			filters=filters,
+			order_by=order_by,
+			limit=chunk_size,
+			offset=offset,
+			for_update=for_update,
+			child_tables=child_tables,
+			distinct=distinct,
+		)
+		if not chunk_data:
+			break
+		yield from _build_document_objects(controller, chunk_data, for_update)
+		offset += chunk_size
+
+
+def _fetch_rows(doctype, *, filters, order_by, limit, offset, for_update, child_tables, distinct=False):
+	kwargs = {}
+	if limit is not None:
+		kwargs["limit"] = limit
+	if offset:
+		kwargs["offset"] = offset
+
+	data = frappe.qb.get_query(
+		table=doctype,
+		filters=filters or {},
+		fields=["*"],
+		order_by=order_by,
+		for_update=for_update,
+		distinct=distinct,
+		**kwargs,
+	).run(as_dict=True)
+
+	if not data:
+		return []
+
+	for row in data:
+		row["doctype"] = doctype
+
+	fetched_docs_by_name = {row.name: row for row in data}
+	parent_names = list(fetched_docs_by_name.keys())
+
+	for fieldname, child_doctype in child_tables:
+		child_table_data = frappe.qb.get_query(
+			table=child_doctype,
+			filters={"parent": ("in", parent_names), "parenttype": doctype, "parentfield": fieldname},
+			fields=["*"],
+			order_by="idx asc",
+			for_update=for_update,
+		).run(as_dict=True)
+
+		for child in child_table_data:
+			child["doctype"] = child_doctype
+
+		for parent_doc in fetched_docs_by_name.values():
+			parent_doc[fieldname] = []
+
+		for child in child_table_data:
+			if child.parent in fetched_docs_by_name:
+				fetched_docs_by_name[child.parent][fieldname].append(child)
+
+	return list(fetched_docs_by_name.values())
+
+
+def _build_document_objects(controller, data: list, for_update: bool):
+	for row in data:
+		doc = controller(row)
+		if for_update:
+			doc.flags.for_update = True
+		yield doc
+
+
+def get_doc_permission_check(doc: "Document", check_permission: str | bool | None = None) -> "Document":
+	"""
+	Checks permissions for the given document, if specified.
+
+	:param doc: The document to check permissions for.
+	:param check_permission: The permission to check for, default is "read" if truthy.
+	:return: The document with permissions checked.
+	"""
+	if check_permission:
+		if isinstance(check_permission, str):
+			doc.check_permission(check_permission)
+		else:
+			doc.check_permission("read")
+	return doc
+
+
+class DocsCollection[T]:
+	"""APIs to manage collections of documents."""
+
+	__slots__ = ("_owner_cls",)
+
+	def __set_name__(self, owner: type, name: str) -> None:
+		self._owner_cls = owner
+
+	def __get__(self, instance, owner: type | None = None) -> "DocsCollection[T]":
+		if instance is not None:
+			raise AttributeError(
+				f"`docs` isn't accessible via {type(instance).__name__} instances; use the class instead."
+			)
+		# Bind the actual accessing class so subclasses report their own doctype.
+		bound = DocsCollection.__new__(DocsCollection)
+		bound._owner_cls = owner or self._owner_cls
+		return bound
+
+	@property
+	def _doctype(self) -> str:
+		doctype = getattr(self._owner_cls, "_DOCTYPE_NAME", None)
+		if not doctype:
+			raise AttributeError(
+				f"{self._owner_cls.__name__} does not define `_DOCTYPE_NAME`; "
+				"controller class must declare its DocType name to use `docs`."
+			)
+		return doctype
+
+	def get(
+		self,
+		name: str | int | None = None,
+		*,
+		cached: bool = False,
+		lazy: bool = False,
+		for_update: bool = False,
+		check_permission: str | bool | None = None,  # TODO: Default to true?
+	) -> T:
+		"""Fetch a single document of this DocType by name (or filter dict)."""
+		if cached and lazy:
+			raise ValueError("`cached` and `lazy` are mutually exclusive")
+
+		if not isinstance(name, str | int | None):
+			raise ValueError("`name` has to be a string or integer or None.")
+
+		if lazy:
+			return get_lazy_doc(self._doctype, name, for_update=for_update, check_permission=check_permission)
+		if cached:
+			return get_cached_doc(self._doctype, name)
+		return get_doc(self._doctype, name, for_update=for_update, check_permission=check_permission)
+
+	def last(
+		self,
+		filters: FilterSignature | None = None,
+		order_by: str = "creation desc",
+		*,
+		for_update: bool = False,
+	) -> T:
+		"""Return the most recently created document, optionally filtered."""
+		return get_last_doc(self._doctype, filters=filters, order_by=order_by, for_update=for_update)
+
+	def filter(
+		self,
+		filters: dict | None = None,
+		*,
+		chunk_size: int = 1000,
+		limit: int | None = None,
+		limit_start: int = 0,
+		order_by: str = "creation asc",
+		as_iterator: bool = False,
+		for_update: bool = False,
+		distinct: bool = False,
+	) -> list[T] | Generator[T]:
+		"""Return all documents matching `filters`."""
+		return get_docs(
+			self._doctype,
+			filters=filters,
+			chunk_size=chunk_size,
+			limit=limit,
+			limit_start=limit_start,
+			order_by=order_by,
+			as_iterator=as_iterator,
+			for_update=for_update,
+			distinct=distinct,
+		)
+
+	def new(self, **kwargs) -> T:
+		"""Create a new (unsaved) document with the given field values."""
+		return new_doc(self._doctype, **kwargs)
+
+
+class Document(BaseDocument):
 	"""All controllers inherit from `Document`."""
+
+	_DOCTYPE_NAME: ClassVar[str | None] = None
+	docs: "DocsCollection[Self]" = DocsCollection()
 
 	doctype: DF.Data
 	name: DF.Data | None
@@ -167,39 +467,27 @@ class Document(BaseDocument, DocRef):
 		self.name = None
 		self.flags = frappe._dict()
 		if args:
-			self._init_dispatch(args[0], *args[1:], **kwargs)
-		elif kwargs:
-			self._init_from_kwargs(kwargs)
-		else:
-			raise ValueError("Illegal arguments")
+			first_arg = args[0]
+			if isinstance(first_arg, str):
+				self.doctype = first_arg
+				self.name = first_arg if len(args) == 1 else args[1]
 
-	def _init_from_kwargs(self, kwargs):
-		super().__init__(kwargs)
-		self.init_child_tables()
-		self.init_valid_columns()
+				# for_update is set in flags to avoid changing load_from_db signature
+				# since it is used in virtual doctypes and inherited in child classes
+				self.flags.for_update = kwargs.get("for_update", False)
+				self.load_from_db()
+				return
 
-	def _init_known_doc(self, doctype, name, **kwargs):
-		self.doctype = doctype
-		self.name = name
-		# for_update is set in flags to avoid changing load_from_db signature
-		# since it is used in virtual doctypes and inherited in child classes
-		self.flags.for_update = kwargs.get("for_update")
-		self.load_from_db()
-		if kwargs:  # ad-hoc overrides
-			self._init_from_kwargs(kwargs)
+			if isinstance(first_arg, dict):
+				kwargs = first_arg
 
-	def _init_dispatch(self, arg, *args, **kwargs):
-		if isinstance(arg, str):
-			name = args[0] if args else arg
-			return self._init_known_doc(arg, name, **kwargs)
+		if kwargs:
+			super().__init__(kwargs)
+			self.init_child_tables()
+			self.init_valid_columns()
+			return
 
-		if isinstance(arg, dict):
-			return self._init_from_kwargs(arg)
-
-		if isinstance(arg, DocRef):
-			return self._init_known_doc(arg.doctype, arg.name, **kwargs)
-
-		raise ValueError(f"Unsupported argument type: {type(arg)}")
+		raise ValueError("Illegal arguments")
 
 	@property
 	def is_locked(self):
@@ -207,7 +495,7 @@ class Document(BaseDocument, DocRef):
 		if not file_lock.lock_exists(signature):
 			return False
 
-		if file_lock.lock_age(signature) > DOCUMENT_LOCK_EXPIRTY:
+		if file_lock.lock_age(signature) > DOCUMENT_LOCK_EXPIRY:
 			return False
 
 		return True
@@ -223,15 +511,15 @@ class Document(BaseDocument, DocRef):
 			single_doc = frappe.db.get_singles_dict(self.doctype, for_update=self.flags.for_update)
 			if not single_doc:
 				single_doc = frappe.new_doc(self.doctype, as_dict=True)
-				single_doc["name"] = self.doctype
 				del single_doc["__islocal"]
+			single_doc["name"] = self.doctype
 
 			super().__init__(single_doc)
 			self.init_valid_columns()
 			self._fix_numeric_types()
 
 		else:
-			if not is_doctype and isinstance(self.name, str):
+			if not is_doctype and isinstance(self.name, str | int):
 				for_update = ""
 				if self.flags.for_update and frappe.db.db_type != "sqlite":
 					for_update = "FOR UPDATE"
@@ -263,6 +551,8 @@ class Document(BaseDocument, DocRef):
 			super().__init__(d)
 		self.flags.pop("ignore_children", None)
 
+		assert self.name, "document must have a name after loading from db"
+
 		self.load_children_from_db()
 
 		# sometimes __setup__ can depend on child values, hence calling again at the end
@@ -271,13 +561,41 @@ class Document(BaseDocument, DocRef):
 
 		return self
 
+	def mask_fields(self):
+		from frappe.model.db_query import mask_field_value
+
+		mask_fields = frappe.get_meta(self.doctype).get_masked_fields()
+
+		if mask_fields:
+			# Flag masked fields so get_valid_dict() does not cast the XXXXXXXX placeholder
+			# back to 0 for numeric fieldtypes when serializing the response.
+			self.flags.masked_fieldnames = {field.fieldname for field in mask_fields}
+
+		for field in mask_fields:
+			val = self.get(field.fieldname)
+			self.set(field.fieldname, mask_field_value(field, val))
+
+		for table_field in self.meta.get_table_fields():
+			child_mask_fields = frappe.get_meta(table_field.options).get_masked_fields(
+				parenttype=self.doctype
+			)
+			if not child_mask_fields:
+				continue
+
+			masked_fieldnames = {field.fieldname for field in child_mask_fields}
+			for row in self.get(table_field.fieldname) or []:
+				row.flags.masked_fieldnames = masked_fieldnames
+				for field in child_mask_fields:
+					row.set(field.fieldname, mask_field_value(field, row.get(field.fieldname)))
+
 	def load_children_from_db(self):
 		is_doctype = self.doctype == "DocType"
 
 		for fieldname, child_doctype in self._table_fieldnames.items():
 			# Make sure not to query the DB for a child table, if it is a virtual one.
 			if not is_doctype and is_virtual_doctype(child_doctype):
-				self.set(fieldname, [])
+				# Remove cache so that the virtual field loads again
+				self.__dict__.pop(fieldname, None)
 				continue
 
 			if is_doctype:
@@ -292,22 +610,7 @@ class Document(BaseDocument, DocRef):
 					for_update=self.flags.for_update,
 				)
 			else:
-				for_update = ""
-				if self.flags.for_update and frappe.db.db_type != "sqlite":
-					for_update = "FOR UPDATE"
-				# Fast pass for all other doctypes - using raw SQL
-				children = frappe.db.sql(
-					"""SELECT * FROM {table_name}
-					WHERE `parent`= %(parent)s
-						AND `parenttype`= %(parenttype)s
-						AND `parentfield`= %(parentfield)s
-					ORDER BY `idx` ASC {for_update}""".format(
-						table_name=get_table_name(child_doctype, wrap_in_backticks=True),
-						for_update=for_update,
-					),
-					{"parent": self.name, "parenttype": self.doctype, "parentfield": fieldname},
-					as_dict=True,
-				)
+				children = self._load_child_table_from_db(fieldname, child_doctype)
 
 			if children is None:
 				children = []
@@ -315,6 +618,24 @@ class Document(BaseDocument, DocRef):
 			self.set(fieldname, children)
 
 		return self
+
+	def _load_child_table_from_db(self, fieldname, child_doctype):
+		for_update = ""
+		if self.flags.for_update and frappe.db.db_type != "sqlite":
+			for_update = "FOR UPDATE"
+		# Fast pass for all other doctypes - using raw SQL
+		return frappe.db.sql(
+			"""SELECT * FROM {table_name}
+			WHERE `parent`= %(parent)s
+				AND `parenttype`= %(parenttype)s
+				AND `parentfield`= %(parentfield)s
+			ORDER BY `idx` ASC {for_update}""".format(
+				table_name=get_table_name(child_doctype, wrap_in_backticks=True),
+				for_update=for_update,
+			),
+			{"parent": str(self.name), "parenttype": self.doctype, "parentfield": fieldname},
+			as_dict=True,
+		)
 
 	def reload(self) -> "Self":
 		"""Reload document from database"""
@@ -348,17 +669,22 @@ class Document(BaseDocument, DocRef):
 	def _handle_permission_failure(self, perm_type):
 		from frappe.permissions import check_doctype_permission
 
-		check_doctype_permission(self.doctype, perm_type)
+		parent_doctype = self.get("parenttype") if self.meta.istable else None
+		check_doctype_permission(parent_doctype or self.doctype, perm_type)
 		self.raise_no_permission_to(perm_type)
 
 	def raise_no_permission_to(self, perm_type):
 		"""Raise `frappe.PermissionError`."""
+		doctype, name = self.doctype, self.name
+		if self.meta.istable and self.get("parenttype"):
+			doctype, name = self.parenttype, self.parent
+
 		frappe.flags.error_message = _(
 			"You need the '{0}' permission on {1} {2} to perform this action."
 		).format(
 			_(perm_type),
-			frappe.bold(_(self.doctype)),
-			self.name or "",
+			frappe.bold(_(doctype)),
+			name or "",
 		)
 		raise frappe.PermissionError
 
@@ -401,9 +727,9 @@ class Document(BaseDocument, DocRef):
 		self._set_defaults()
 		self.set_user_and_timestamp()
 		self.set_docstatus()
+		self.check_permission("create")
 		self.check_if_latest()
 		self._validate_links()
-		self.check_permission("create")
 		self.run_method("before_insert")
 		self.set_new_name(set_name=set_name, set_child_names=set_child_names)
 		self.set_parent_in_children()
@@ -428,6 +754,7 @@ class Document(BaseDocument, DocRef):
 			for d in self.get_all_children():
 				d.db_insert()
 
+		self.reset_computed_child_tables()
 		self.run_method("after_insert")
 		self.flags.in_insert = True
 
@@ -449,7 +776,7 @@ class Document(BaseDocument, DocRef):
 
 		if not (frappe.flags.in_migrate or frappe.local.flags.in_install or frappe.flags.in_setup_wizard):
 			if frappe.get_cached_value("User", frappe.session.user, "follow_created_documents"):
-				follow_document(self.doctype, self.name, frappe.session.user)
+				_follow_document(self.doctype, self.name, frappe.session.user)
 		return self
 
 	def check_if_locked(self):
@@ -499,13 +826,14 @@ class Document(BaseDocument, DocRef):
 		if ignore_permissions is not None:
 			self.flags.ignore_permissions = ignore_permissions
 
-		self.flags.ignore_version = frappe.flags.in_test if ignore_version is None else ignore_version
+		self.flags.ignore_version = frappe.in_test if ignore_version is None else ignore_version
 
 		if self.get("__islocal") or not self.get("name"):
 			return self.insert()
 
 		self.check_if_locked()
 		self._set_defaults()
+		self._restore_masked_fields_from_db()
 		self.check_permission("write", "save")
 
 		self.set_user_and_timestamp()
@@ -533,6 +861,7 @@ class Document(BaseDocument, DocRef):
 			self.db_update()
 
 		self.update_children()
+		self.reset_computed_child_tables()
 		self.run_post_save_methods()
 
 		# clear unsaved flag
@@ -562,7 +891,8 @@ class Document(BaseDocument, DocRef):
 					"file_name": attach_item.file_name,
 					"attached_to_name": self.name,
 					"attached_to_doctype": self.doctype,
-					"folder": "Home/Attachments",
+					"attached_to_field": attach_item.attached_to_field,
+					"folder": attach_item.folder or "Home/Attachments",
 					"is_private": attach_item.is_private,
 				}
 			)
@@ -577,9 +907,11 @@ class Document(BaseDocument, DocRef):
 		for df in self.meta.get_table_fields():
 			self.update_child_table(df.fieldname, df)
 
-	def update_child_table(self, fieldname: str, df: Optional["DocField"] = None):
+	def update_child_table(self, fieldname: str, df: "DocField" | None = None):
 		"""sync child table for given fieldname"""
 		df: DocField = df or self.meta.get_field(fieldname)
+		if df.is_virtual:
+			return
 		all_rows = self.get(df.fieldname)
 
 		# delete rows that do not match the ones in the document
@@ -593,7 +925,7 @@ class Document(BaseDocument, DocRef):
 			tbl = frappe.qb.DocType(df.options)
 			qry = (
 				frappe.qb.from_(tbl)
-				.where(tbl.parent == self.name)
+				.where(tbl.parent == str(self.name))
 				.where(tbl.parenttype == self.doctype)
 				.where(tbl.parentfield == fieldname)
 				.delete()
@@ -608,6 +940,12 @@ class Document(BaseDocument, DocRef):
 		for d in all_rows:
 			d: Document
 			d.db_update()
+
+	def reset_computed_child_tables(self):
+		"""Reset computed child tables so that they are reloaded next time"""
+		for df in self.meta.get_table_fields(include_computed=True):
+			if df.is_virtual:
+				self.__dict__.pop(df.fieldname, None)
 
 	def get_doc_before_save(self) -> "Self":
 		return getattr(self, "_doc_before_save", None)
@@ -668,6 +1006,7 @@ class Document(BaseDocument, DocRef):
 				set_new_name(d)
 
 		self.flags.name_set = True
+		assert self.name, "document name must be set after set_new_name"
 
 	def get_title(self):
 		"""Get the document title based on title_field or `title` or `name`"""
@@ -695,6 +1034,9 @@ class Document(BaseDocument, DocRef):
 
 	def update_single(self, d):
 		"""Updates values for Single type Document in `tabSingles`."""
+		if self.meta.is_virtual:
+			return
+
 		frappe.db.delete("Singles", {"doctype": self.doctype})
 		for field, value in d.items():
 			if field != "doctype":
@@ -705,7 +1047,7 @@ class Document(BaseDocument, DocRef):
 				)
 
 		if self.doctype in frappe.db.value_cache:
-			del frappe.db.value_cache[self.doctype]
+			frappe.db.value_cache.pop(self.doctype, None)
 
 	def set_user_and_timestamp(self):
 		self._original_modified = self.modified
@@ -742,6 +1084,7 @@ class Document(BaseDocument, DocRef):
 		self._validate_data_fields()
 		self._validate_selects()
 		self._validate_non_negative()
+		self._validate_min_max_value()
 		self._validate_length()
 		self._fix_rating_value()
 		self._validate_code_fields()
@@ -755,6 +1098,7 @@ class Document(BaseDocument, DocRef):
 			d._validate_data_fields()
 			d._validate_selects()
 			d._validate_non_negative()
+			d._validate_min_max_value()
 			d._validate_length()
 			d._fix_rating_value()
 			d._validate_code_fields()
@@ -785,11 +1129,50 @@ class Document(BaseDocument, DocRef):
 				)
 
 		for df in self.meta.get(
-			"fields", {"non_negative": ("=", 1), "fieldtype": ("in", ["Int", "Float", "Currency"])}
+			"fields", {"non_negative": ("=", 1), "fieldtype": ("in", ["Int", "Float", "Currency", "Percent"])}
 		):
 			if flt(self.get(df.fieldname)) < 0:
 				msg = get_msg(df)
 				frappe.throw(msg, frappe.NonNegativeError, title=_("Negative Value"))
+
+	def _validate_min_max_value(self):
+		def get_msg(df, constraint):
+			if self.get("parentfield"):
+				return "{} {} #{}: {} {}".format(
+					frappe.bold(_(self.doctype)),
+					_("Row"),
+					self.idx,
+					constraint,
+					frappe.bold(_(df.label, context=df.parent)),
+				)
+			else:
+				return "{} {}: {}".format(
+					constraint, _(df.parent), frappe.bold(_(df.label, context=df.parent))
+				)
+
+		for df in self.meta.get("fields", {"fieldtype": ("in", ["Int", "Float", "Currency", "Percent"])}):
+			min_value = flt(df.get("min_value"))
+			max_value = flt(df.get("max_value"))
+
+			if df.fieldtype == "Int":
+				min_value, max_value = cint(min_value), cint(max_value)
+
+			if not (min_value or max_value):
+				continue
+
+			value = self.get(df.fieldname)
+			if value in (None, ""):
+				continue
+
+			value = flt(value)
+
+			if min_value and value < min_value:
+				msg = get_msg(df, _("Value cannot be less than {0} for").format(frappe.bold(min_value)))
+				frappe.throw(msg, title=_("Value is too small"))
+
+			if max_value and value > max_value:
+				msg = get_msg(df, _("Value cannot be more than {0} for").format(frappe.bold(max_value)))
+				frappe.throw(msg, title=_("Value is too large"))
 
 	def _fix_rating_value(self):
 		for field in self.meta.get("fields", {"fieldtype": "Rating"}):
@@ -831,7 +1214,7 @@ class Document(BaseDocument, DocRef):
 				if fail:
 					frappe.throw(
 						_("Value cannot be changed for {0}").format(
-							frappe.bold(self.meta.get_label(field.fieldname))
+							frappe.bold(self.meta.get_translated_label(field.fieldname))
 						),
 						exc=frappe.CannotChangeConstantError,
 					)
@@ -840,9 +1223,13 @@ class Document(BaseDocument, DocRef):
 
 	def is_child_table_same(self, fieldname):
 		"""Validate child table is same as original table before saving"""
+
+		if self.is_new():
+			return False
+
+		same = True
 		value = self.get(fieldname)
 		original_value = self._doc_before_save.get(fieldname)
-		same = True
 
 		if len(original_value) != len(value):
 			same = False
@@ -864,15 +1251,16 @@ class Document(BaseDocument, DocRef):
 		return same
 
 	def apply_fieldlevel_read_permissions(self):
-		"""Remove values the user is not allowed to read."""
+		"""Remove values the user is not allowed to read, and mask fields per mask permissions."""
 		if frappe.session.user == "Administrator":
 			return
 
 		all_fields = self.meta.fields.copy()
-		for table_field in self.meta.get_table_fields():
+		for table_field in self.meta.get_table_fields(include_computed=True):
 			all_fields += frappe.get_meta(table_field.options).fields or []
 
 		if all(df.permlevel == 0 for df in all_fields):
+			self.mask_fields()
 			return
 
 		has_access_to = self.get_permlevel_access("read")
@@ -885,12 +1273,46 @@ class Document(BaseDocument, DocRef):
 					# hasattr might return True for class attribute which can't be delattr-ed.
 					continue
 
-		for table_field in self.meta.get_table_fields():
+		for table_field in self.meta.get_table_fields(include_computed=True):
 			for df in frappe.get_meta(table_field.options).fields or []:
 				if df.permlevel and df.permlevel not in has_access_to:
 					for child in self.get(table_field.fieldname) or []:
 						if hasattr(child, df.fieldname):
 							delattr(child, df.fieldname)
+
+		self.mask_fields()
+
+	def _restore_masked_fields_from_db(self):
+		"""Restore masked field values from DB so that link-field user-permission checks
+		are not tripped by the XXXXXXXX placeholder sent from the client."""
+		if frappe.flags.in_install or frappe.session.user == "Administrator" or self.is_new():
+			return
+
+		mask_fields = self.meta.get_masked_fields()
+		child_mask_fields = {
+			table_field.fieldname: masked
+			for table_field in self.meta.get_table_fields()
+			if (masked := frappe.get_meta(table_field.options).get_masked_fields(parenttype=self.doctype))
+		}
+		if not mask_fields and not child_mask_fields:
+			return
+
+		# frappe.db.get_value() goes through the query builder which re-masks results for
+		# non-admin users, returning XXXXXXXX. frappe.get_doc() uses load_from_db() which
+		# queries the DB directly and always returns the actual stored value.
+		db_doc = frappe.get_doc(self.doctype, self.name)
+		for df in mask_fields:
+			self.set(df.fieldname, db_doc.get(df.fieldname))
+
+		for fieldname, masked in child_mask_fields.items():
+			db_rows = {row.name: row for row in db_doc.get(fieldname)}
+			for row in self.get(fieldname) or []:
+				db_row = db_rows.get(row.name)
+				# new rows have no DB counterpart — nothing to restore
+				if not db_row:
+					continue
+				for df in masked:
+					row.set(df.fieldname, db_row.get(df.fieldname))
 
 	def validate_higher_perm_levels(self):
 		"""If the user does not have permissions at permlevel > 0, then reset the values to original / default"""
@@ -990,7 +1412,7 @@ class Document(BaseDocument, DocRef):
 		if not self.meta.issingle and self._action != "discard":
 			self.check_docstatus_transition(previous.docstatus)
 
-	def check_docstatus_transition(self, to_docstatus):
+	def check_docstatus_transition(self, from_docstatus):
 		"""Ensures valid `docstatus` transition.
 		Valid transitions are (number in brackets is `docstatus`):
 
@@ -1000,34 +1422,49 @@ class Document(BaseDocument, DocRef):
 		- Submit (1) > Cancel (2)
 
 		"""
-		if to_docstatus == DocStatus.DRAFT:
-			if self.docstatus.is_draft():
+		assert from_docstatus in (
+			DocStatus.DRAFT,
+			DocStatus.SUBMITTED,
+			DocStatus.CANCELLED,
+		), "from_docstatus must be a valid docstatus (0, 1, or 2)"
+
+		if self.flags.skip_docstatus_validation:
+			return
+
+		to_docstatus = self.docstatus
+		if from_docstatus == DocStatus.DRAFT:
+			if to_docstatus.is_draft():
 				self._action = "save"
-			elif self.docstatus.is_submitted():
+			elif to_docstatus.is_submitted():
+				if not getattr(self.meta, "is_submittable", False):
+					frappe.throw(
+						_("Cannot change docstatus of non submittable doctype {0}").format(self.doctype),
+						frappe.DocstatusTransitionError,
+					)
 				self._action = "submit"
 				self.check_permission("submit")
-			elif self.docstatus.is_cancelled():
+			elif to_docstatus.is_cancelled():
 				raise frappe.DocstatusTransitionError(
 					_("Cannot change docstatus from 0 (Draft) to 2 (Cancelled)")
 				)
 			else:
-				raise frappe.ValidationError(_("Invalid docstatus"), self.docstatus)
+				raise frappe.ValidationError(_("Invalid docstatus"), to_docstatus)
 
-		elif to_docstatus == DocStatus.SUBMITTED:
-			if self.docstatus.is_submitted():
+		elif from_docstatus == DocStatus.SUBMITTED:
+			if to_docstatus.is_submitted():
 				self._action = "update_after_submit"
 				self.check_permission("submit")
-			elif self.docstatus.is_cancelled():
+			elif to_docstatus.is_cancelled():
 				self._action = "cancel"
 				self.check_permission("cancel")
-			elif self.docstatus.is_draft():
+			elif to_docstatus.is_draft():
 				raise frappe.DocstatusTransitionError(
 					_("Cannot change docstatus from 1 (Submitted) to 0 (Draft)")
 				)
 			else:
-				raise frappe.ValidationError(_("Invalid docstatus"), self.docstatus)
+				raise frappe.ValidationError(_("Invalid docstatus"), to_docstatus)
 
-		elif to_docstatus == DocStatus.CANCELLED:
+		elif from_docstatus == DocStatus.CANCELLED:
 			raise frappe.ValidationError(_("Cannot edit cancelled document"))
 
 	def set_parent_in_children(self):
@@ -1079,14 +1516,144 @@ class Document(BaseDocument, DocRef):
 			)
 		)
 
+	def _prefetch_link_values(self):
+		"""Pre-fetch all link values including fetch_from fields for bulk validation.
+
+		This optimization collects all Link/Dynamic Link values from the doc tree,
+		then bulk-fetches them by doctype to eliminate N+1 queries.
+		"""
+		if self.flags.ignore_links or self._action == "cancel":
+			return
+
+		from collections import defaultdict
+
+		def _chunk(iterable, size):
+			"""Split iterable into chunks of given size."""
+			lst = list(iterable)
+			for i in range(0, len(lst), size):
+				yield lst[i : i + size]
+
+		self._link_value_cache = {}
+		docs_to_validate = [self, *self.get_all_children()]
+
+		# Collect: {doctype: {'names': set(), 'fields': set()}}
+		prefetch_map = defaultdict(lambda: {"names": set(), "fields": {"name"}})
+
+		for doc in docs_to_validate:
+			is_submittable = self.meta.is_submittable
+			link_fields = doc.meta.get_link_fields() + doc.meta.get(
+				"fields", {"fieldtype": ("=", "Dynamic Link")}
+			)
+
+			for df in link_fields:
+				docname = doc.get(df.fieldname)
+				if not docname:
+					continue
+
+				# Skip invalid docname types - let get_invalid_links handle the assertion
+				if not isinstance(docname, str | int):
+					continue
+
+				# Resolve target doctype
+				if df.fieldtype == "Link":
+					doctype = df.options
+					if not doctype:
+						continue
+				else:  # Dynamic Link
+					doctype = doc.get(df.options)
+					if not doctype:
+						continue
+
+				prefetch_map[doctype]["names"].add(docname)
+
+				# Collect fetch_from fields - fetch ALL, let base_document handle fetch_if_empty
+				for fetch_df in doc.meta.get_fields_to_fetch(df.fieldname):
+					if fetch_df.get("fetch_from"):
+						source_field = fetch_df.fetch_from.split(".")[-1]
+						prefetch_map[doctype]["fields"].add(source_field)
+
+				# Add docstatus if needed
+				target_meta = frappe.get_meta(doctype)
+				if is_submittable and target_meta.is_submittable:
+					prefetch_map[doctype]["fields"].add("docstatus")
+
+		# Bulk fetch with chunking
+		for doctype, data in prefetch_map.items():
+			meta = frappe.get_meta(doctype)
+			names = list(data["names"])
+			fields = sorted(data["fields"])  # Sorted for deterministic cache key matching
+
+			# Skip if no names to fetch for this doctype
+			if not names:
+				continue
+
+			if meta.get("is_virtual"):
+				# Virtual doctypes: fetch individually
+				for name in names:
+					try:
+						values = frappe.get_doc(doctype, name).as_dict()
+					except frappe.DoesNotExistError:
+						values = None
+					self._link_value_cache.setdefault(doctype, {})[name] = values
+
+			elif getattr(meta, "issingle", 0):
+				# Single doctypes
+				values = frappe.db.get_singles_dict(doctype)
+				values["name"] = doctype
+				for name in names:
+					self._link_value_cache.setdefault(doctype, {})[name] = frappe._dict(values)
+
+			else:
+				# Regular doctypes: bulk fetch with chunking
+				result_dict = {}
+				field_tuple = tuple(fields)
+
+				for name_chunk in _chunk(names, 1000):
+					results = frappe.db.get_all(
+						doctype,
+						filters={"name": ("in", name_chunk)},
+						fields=fields,
+					)
+					for row in results:
+						result_dict[row.name] = row
+						# Link fields may carry "123" (text) while autoincrement doctypes return 123 (int);
+						# adding str(name) avoids false cache misses that surface as invalid-link errors.
+						result_dict[str(row.name)] = row
+						# Case-insensitive key for MariaDB compatibility (strings only)
+						if frappe.db.db_type == "mariadb" and isinstance(row.name, str):
+							result_dict[row.name.casefold()] = row
+
+				# Store results in both caches
+				for name in names:
+					if frappe.db.db_type == "mariadb" and isinstance(name, str):
+						cached_value = (
+							result_dict.get(name)
+							or result_dict.get(str(name))
+							or result_dict.get(name.casefold())
+						)
+					else:
+						cached_value = result_dict.get(name) or result_dict.get(str(name))
+
+					# Store in local document cache
+					self._link_value_cache.setdefault(doctype, {})[name] = cached_value
+
+					# Also populate global db.value_cache for cross-document caching
+					# Only for string names (matching get_values behavior at line 632)
+					if cached_value is not None and isinstance(name, str):
+						frappe.db.value_cache[doctype][name][field_tuple] = [cached_value]
+
 	def _validate_links(self):
 		if self.flags.ignore_links or self._action == "cancel":
 			return
 
-		invalid_links, cancelled_links = self.get_invalid_links()
+		# Pre-fetch all link values in bulk
+		self._prefetch_link_values()
+		link_cache = getattr(self, "_link_value_cache", None)
+
+		invalid_links, cancelled_links = self.get_invalid_links(link_value_cache=link_cache)
 
 		for d in self.get_all_children():
-			result = d.get_invalid_links(is_submittable=self.meta.is_submittable)
+			result = d.get_invalid_links(is_submittable=self.meta.is_submittable, link_value_cache=link_cache)
 			invalid_links.extend(result[0])
 			cancelled_links.extend(result[1])
 
@@ -1098,12 +1665,16 @@ class Document(BaseDocument, DocRef):
 			msg = ", ".join(each[2] for each in cancelled_links)
 			frappe.throw(_("Cannot link cancelled document: {0}").format(msg), frappe.CancelledLinkError)
 
-	def get_all_children(self, parenttype=None) -> list["Document"]:
-		"""Return all children documents from **Table** type fields in a list."""
+	def get_all_children(self, parenttype=None, *, include_computed=False) -> list["Document"]:
+		"""
+		Return all child documents from **Table** type fields in a list.
+		Excludes computed tables by default, unless `include_computed` is set to True.
+		"""
 
 		children = []
+		table_fieldnames = self._table_fieldnames if include_computed else self._non_computed_table_fieldnames
 
-		for fieldname, child_doctype in self._table_fieldnames.items():
+		for fieldname, child_doctype in table_fieldnames.items():
 			if parenttype and child_doctype != parenttype:
 				continue
 
@@ -1112,8 +1683,11 @@ class Document(BaseDocument, DocRef):
 
 		return children
 
-	def run_method(self, method, *args, **kwargs):
+	def run_method(self, method: str, *args, **kwargs):
 		"""run standard triggers, plus those in hooks"""
+
+		if method.startswith("_"):
+			raise Exception("Run method is for hooks, avoid usage on internal methods")
 
 		def fn(self, *args, **kwargs):
 			method_object = getattr(self, method, None)
@@ -1152,11 +1726,16 @@ class Document(BaseDocument, DocRef):
 
 		def _get_notifications():
 			"""Return enabled notifications for the current doctype."""
+			from frappe.app_state import get_disabled_modules
+
+			filters = {"enabled": 1, "document_type": self.doctype}
+			if disabled_modules := get_disabled_modules():
+				filters["module"] = ["not in", list(disabled_modules)]
 
 			return frappe.get_all(
 				"Notification",
 				fields=["name", "event", "method"],
-				filters={"enabled": 1, "document_type": self.doctype},
+				filters=filters,
 			)
 
 		notifications = frappe.client_cache.get_value(
@@ -1201,7 +1780,9 @@ class Document(BaseDocument, DocRef):
 		self.docstatus = DocStatus.CANCELLED
 		return self.save()
 
-	def _rename(self, name: str, merge: bool = False, force: bool = False, validate_rename: bool = True):
+	def _rename(
+		self, name: str | int, merge: bool = False, force: bool = False, validate_rename: bool = True
+	):
 		"""Rename the document. Triggers frappe.rename_doc, then reloads."""
 		from frappe.model.rename_doc import rename_doc
 
@@ -1238,7 +1819,7 @@ class Document(BaseDocument, DocRef):
 		self.run_method("on_discard")
 
 	@frappe.whitelist()
-	def rename(self, name: str, merge=False, force=False, validate_rename=True):
+	def rename(self, name: str | int, merge: bool = False, force: bool = False, validate_rename: bool = True):
 		"""Rename the document to `name`. This transforms the current object."""
 		return self._rename(name=name, merge=merge, force=force, validate_rename=validate_rename)
 
@@ -1288,7 +1869,7 @@ class Document(BaseDocument, DocRef):
 	def load_doc_before_save(self, *, raise_exception: bool = False):
 		"""load existing document from db before saving"""
 
-		self._doc_before_save = None
+		self._doc_before_save: "Self | None" = None
 
 		if self.is_new():
 			return
@@ -1299,7 +1880,13 @@ class Document(BaseDocument, DocRef):
 			if raise_exception:
 				raise
 
-			frappe.clear_last_message()
+			return frappe.clear_last_message()
+
+		for fieldname in self._non_computed_table_fieldnames:
+			for row in self.get(fieldname) or []:
+				row._doc_before_save = next(
+					(d for d in (self._doc_before_save.get(fieldname) or []) if d.name == row.name), None
+				)
 
 	def run_post_save_methods(self):
 		"""Run standard methods after `INSERT` or `UPDATE`. Standard Methods are:
@@ -1320,7 +1907,8 @@ class Document(BaseDocument, DocRef):
 		elif self._action == "update_after_submit":
 			self.run_method("on_update_after_submit")
 
-		self.clear_cache()
+		if not (frappe.flags.in_import and self.is_new()):
+			self.clear_cache()
 
 		if self.flags.get("notify_update", True):
 			self.notify_update()
@@ -1350,7 +1938,12 @@ class Document(BaseDocument, DocRef):
 
 	def notify_update(self):
 		"""Publish realtime that the current document is modified"""
-		if frappe.flags.in_patch:
+		if (
+			frappe.flags.in_import
+			or frappe.flags.in_patch
+			or frappe.flags.in_migrate
+			or frappe.flags.in_install
+		):
 			return
 
 		frappe.publish_realtime(
@@ -1389,7 +1982,7 @@ class Document(BaseDocument, DocRef):
 			self.set("modified_by", frappe.session.user)
 
 		# load but do not reload doc_before_save because before_change or on_change might expect it
-		if not self.get_doc_before_save():
+		if not self.get_doc_before_save() and not self.meta.istable:
 			self.load_doc_before_save()
 
 		# to trigger notification on value change
@@ -1456,13 +2049,12 @@ class Document(BaseDocument, DocRef):
 			doc_to_compare = frappe.get_doc(self.doctype, amended_from)
 
 		version = frappe.new_doc("Version")
+
+		if not doc_to_compare and not self.flags.updater_reference:
+			return
+
 		if version.update_version_info(doc_to_compare, self):
 			version.insert(ignore_permissions=True)
-
-			if not frappe.flags.in_migrate:
-				# follow since you made a change?
-				if frappe.get_cached_value("User", frappe.session.user, "follow_created_documents"):
-					follow_document(self.doctype, self.name, frappe.session.user)
 
 	@staticmethod
 	def hook(f):
@@ -1490,7 +2082,11 @@ class Document(BaseDocument, DocRef):
 				for f in hooks:
 					try:
 						frappe.db._disable_transaction_control += 1
-						add_to_return_value(self, f(self, method, *args, **kwargs))
+						# Allow handlers to be defined without method arg, e.g. `handler(doc)`
+						if not args and not _accepts_method_argument(f):
+							add_to_return_value(self, f(self, **kwargs))
+						else:
+							add_to_return_value(self, f(self, method, *args, **kwargs))
 					finally:
 						frappe.db._disable_transaction_control -= 1
 
@@ -1531,7 +2127,7 @@ class Document(BaseDocument, DocRef):
 		val2 = doc.cast(val2, df)
 
 		if not compare(val1, condition, val2):
-			label = doc.meta.get_label(fieldname)
+			label = doc.meta.get_translated_label(fieldname)
 			if doc.get("parentfield"):
 				msg = _("Incorrect value in row {0}:").format(doc.idx)
 			else:
@@ -1554,12 +2150,12 @@ class Document(BaseDocument, DocRef):
 	def validate_table_has_rows(self, parentfield, raise_exception=None):
 		"""Raise exception if Table field is empty."""
 		if not (isinstance(self.get(parentfield), list) and len(self.get(parentfield)) > 0):
-			label = self.meta.get_label(parentfield)
+			label = self.meta.get_translated_label(parentfield)
 			frappe.throw(
 				_("Table {0} cannot be empty").format(label), raise_exception or frappe.EmptyTableError
 			)
 
-	def round_floats_in(self, doc, fieldnames=None):
+	def round_floats_in(self, doc, fieldnames=None, do_not_round_fields=None):
 		"""Round floats for all `Currency`, `Float`, `Percent` fields for the given doc.
 
 		:param doc: Document whose numeric properties are to be rounded.
@@ -1573,6 +2169,9 @@ class Document(BaseDocument, DocRef):
 		# PERF: flt internally has to resolve this if we don't specify it.
 		rounding_method = frappe.get_system_settings("rounding_method")
 		for fieldname in fieldnames:
+			if do_not_round_fields and fieldname in do_not_round_fields:
+				continue
+
 			doc.set(
 				fieldname,
 				flt(
@@ -1589,10 +2188,10 @@ class Document(BaseDocument, DocRef):
 	@frappe.whitelist()
 	def add_comment(
 		self,
-		comment_type="Comment",
-		text=None,
-		comment_email=None,
-		comment_by=None,
+		comment_type: str = "Comment",
+		text: str | None = None,
+		comment_email: str | None = None,
+		comment_by: str | None = None,
 	):
 		"""Add a comment to this document.
 
@@ -1621,10 +2220,11 @@ class Document(BaseDocument, DocRef):
 
 			if user not in _seen:
 				_seen.append(user)
-				frappe.db.set_value(
-					self.doctype, self.name, "_seen", json.dumps(_seen), update_modified=False
+				commit_after_response(
+					lambda: frappe.db.set_value(
+						self.doctype, self.name, "_seen", json.dumps(_seen), update_modified=False
+					)
 				)
-				frappe.local.flags.commit = True
 
 	def add_viewed(self, user=None, force=False, unique_views=False):
 		"""Add a view log for the current document"""
@@ -1650,15 +2250,18 @@ class Document(BaseDocument, DocRef):
 		if frappe.flags.read_only:
 			view_log.deferred_insert()
 		else:
-			view_log.insert(ignore_permissions=True)
-			frappe.local.flags.commit = True
+			commit_after_response(lambda: view_log.insert(ignore_permissions=True))
 
 		return view_log
 
-	def log_error(self, title=None, message=None):
+	def log_error(self, title=None, message=None, *, defer_insert=False):
 		"""Helper function to create an Error Log"""
 		return frappe.log_error(
-			message=message, title=title, reference_doctype=self.doctype, reference_name=self.name
+			message=message,
+			title=title,
+			reference_doctype=self.doctype,
+			reference_name=self.name,
+			defer_insert=defer_insert,
 		)
 
 	def get_signature(self):
@@ -1696,16 +2299,20 @@ class Document(BaseDocument, DocRef):
 		else:
 			return []
 
+	@property
+	def __onload(self):
+		onload = self.get("__onload")
+		if onload is None:
+			onload = frappe._dict()
+			self.set("__onload", onload)
+
+		return onload
+
 	def set_onload(self, key, value):
-		if not self.get("__onload"):
-			self.set("__onload", frappe._dict())
-		self.get("__onload")[key] = value
+		self.__onload[key] = value
 
 	def get_onload(self, key=None):
-		if not key:
-			return self.get("__onload", frappe._dict())
-
-		return self.get("__onload")[key]
+		return self.__onload[key] if key else self.__onload
 
 	def queue_action(self, action, **kwargs):
 		"""Run an action in background. If the action has an inner function,
@@ -1742,7 +2349,7 @@ class Document(BaseDocument, DocRef):
 		signature = self.get_signature()
 		if file_lock.lock_exists(signature):
 			lock_exists = True
-			if file_lock.lock_age(signature) > DOCUMENT_LOCK_EXPIRTY:
+			if file_lock.lock_age(signature) > DOCUMENT_LOCK_EXPIRY:
 				file_lock.delete_lock(signature)
 				lock_exists = False
 			if timeout:
@@ -1772,16 +2379,19 @@ class Document(BaseDocument, DocRef):
 		if date_diff(to_date, from_date) < 0:
 			table_row = ""
 			if self.meta.istable:
-				table_row = _("{0} row #{1}: ").format(
-					_(frappe.unscrub(self.parentfield)),
-					self.idx,
+				table_row = (
+					_("{0} row #{1}:").format(
+						_(frappe.unscrub(self.parentfield)),
+						self.idx,
+					)
+					+ " "
 				)
 
 			frappe.throw(
 				table_row
 				+ _("{0} must be after {1}").format(
-					frappe.bold(_(self.meta.get_label(to_date_field))),
-					frappe.bold(_(self.meta.get_label(from_date_field))),
+					frappe.bold(self.meta.get_translated_label(to_date_field)),
+					frappe.bold(self.meta.get_translated_label(from_date_field)),
 				),
 				frappe.exceptions.InvalidDates,
 			)
@@ -1816,7 +2426,9 @@ class Document(BaseDocument, DocRef):
 		"""Return a list of Tags attached to this document"""
 		from frappe.desk.doctype.tag.tag import DocTags
 
-		return DocTags(self.doctype).get_tags(self.name).split(",")[1:]
+		tags = DocTags(self.doctype).get_tags(self.name)
+
+		return [tag for tag in tags.split(",") if tag]
 
 	def deferred_insert(self) -> None:
 		"""Push the document to redis temporarily and insert later.
@@ -1867,7 +2479,8 @@ def bulk_insert(
 	doctype: str,
 	documents: Iterable["Document"],
 	ignore_duplicates: bool = False,
-	chunk_size=10_000,
+	chunk_size=1000,
+	commit_chunks=False,
 ):
 	"""Insert simple Documents objects to database in bulk.
 
@@ -1878,37 +2491,43 @@ def bulk_insert(
 	"""
 
 	doctype_meta = frappe.get_meta(doctype)
-	documents = list(documents)
 
 	valid_column_map = {
 		doctype: doctype_meta.get_valid_columns(),
 	}
-	values_map = {
-		doctype: _document_values_generator(documents, valid_column_map[doctype]),
-	}
 
-	for child_table in doctype_meta.get_table_fields():
+	child_table_fields = doctype_meta.get_table_fields()
+	for child_table in child_table_fields:
 		valid_column_map[child_table.options] = frappe.get_meta(child_table.options).get_valid_columns()
-		values_map[child_table.options] = _document_values_generator(
-			[
-				ch_doc
-				for ch_doc in (
-					child_docs for doc in documents for child_docs in doc.get(child_table.fieldname)
-				)
-			],
-			valid_column_map[child_table.options],
-		)
 
-	for dt, docs in values_map.items():
-		frappe.db.bulk_insert(
-			dt, valid_column_map[dt], docs, ignore_duplicates=ignore_duplicates, chunk_size=chunk_size
-		)
+	documents = iter(documents)
+	while document_batch := list(itertools.islice(documents, chunk_size)):
+		values_map = {
+			doctype: _document_values_generator(document_batch, valid_column_map[doctype]),
+		}
+
+		for child_table in child_table_fields:
+			values_map[child_table.options] = _document_values_generator(
+				[
+					ch_doc
+					for ch_doc in (
+						child_docs for doc in document_batch for child_docs in doc.get(child_table.fieldname)
+					)
+				],
+				valid_column_map[child_table.options],
+			)
+
+		for dt, docs in values_map.items():
+			frappe.db.bulk_insert(dt, valid_column_map[dt], docs, ignore_duplicates=ignore_duplicates)
+
+		if commit_chunks:
+			frappe.db.commit()
 
 
 def _document_values_generator(
 	documents: Iterable["Document"],
 	columns: list[str],
-) -> Generator[tuple[Any], None, None]:
+) -> Generator[tuple[Any]]:
 	for doc in documents:
 		doc.creation = doc.modified = now()
 		doc.owner = doc.modified_by = frappe.session.user
@@ -1922,5 +2541,295 @@ def _document_values_generator(
 
 @frappe.whitelist()
 def unlock_document(doctype: str, name: str):
-	frappe.get_doc(doctype, name).unlock()
+	frappe.get_lazy_doc(doctype, name).unlock()
 	frappe.msgprint(frappe._("Document Unlocked"), alert=True)
+
+
+def get_lazy_controller(doctype, *, site=None, meta=None, controller=None):
+	"""Return the lazy-loading controller class for a doctype.
+
+	`site`, `meta` and `controller` default to the current context. They can be passed
+	explicitly during unpickling, where the pickled document must be reconstructed with the
+	same schema it was pickled with and no frappe.local context is available.
+	"""
+	lazy_controllers = frappe.lazy_controllers.setdefault(site or frappe.local.site, {})
+	if doctype not in lazy_controllers:
+		if meta is None:
+			meta = frappe.get_meta(doctype)
+		original_controller = controller or get_controller(doctype)
+		if meta.is_virtual:  # not supported
+			lazy_controllers[doctype] = original_controller
+			warnings.warn(f"Virtual doctypes don't support lazy loading: {doctype}", stacklevel=3)
+			return original_controller
+
+		# Dynamically construct a class that subclasses LazyDocument and original controller.
+		lazy_controller = type(f"Lazy{original_controller.__name__}", (LazyDocument, original_controller), {})
+		for df in meta.get_table_fields():
+			setattr(lazy_controller, df.fieldname, LazyChildTable(df.fieldname, df.options))
+
+		lazy_controllers[doctype] = lazy_controller
+	return lazy_controllers[doctype]
+
+
+def _reconstruct_lazy_doc(site: str, doctype: str, meta, original_controller):
+	"""Reconstruct a lazy document instance during unpickling.
+
+	The lazy controller class is created dynamically, so pickle can't find it by name.
+	Rebuild it from the pickled site, meta and original controller instead, without making
+	any frappe calls that require an initialized frappe.local.
+	"""
+	controller = get_lazy_controller(doctype, site=site, meta=meta, controller=original_controller)
+	return controller.__new__(controller)
+
+
+class LazyDocument:
+	"""Mixin for Document class that implments lazy loading for child tables."""
+
+	def __reduce__(self):
+		"""Make dynamically created lazy controller instances pickle-able."""
+		# Lazy controller is type("Lazy...", (LazyDocument, original_controller), {})
+		original_controller = type(self).__bases__[1]
+		return (
+			_reconstruct_lazy_doc,
+			(frappe.local.site, self.doctype, self.meta, original_controller),
+			self.__getstate__(),
+		)
+
+	@override
+	def load_children_from_db(self: Document):
+		"""Override Document which eagerly loads child tables"""
+		# This is a map of loaded children, it should get erased whenever load_children_from_db is
+		# called to allow reloading lazily again.
+		for fieldname in self._table_fieldnames:
+			self.__dict__.pop(fieldname, None)
+
+	@override
+	def get(self: Document, key, filters=None, limit=None, default=None):
+		# Ensure that table descriptor is triggered at least once
+		if isinstance(key, str) and key in self._table_fieldnames:
+			getattr(self, key, None)
+		return super().get(key, filters, limit, default)
+
+	@override
+	def append(self, key: str, value: D | dict | None = None, position: int = -1) -> D:
+		# Ensure that table descriptor is triggered at least once
+		# key is assumed to be a table fieldname (as expected by BaseDocument.append)
+		if key not in self.__dict__:
+			getattr(self, key, None)
+		return super().append(key, value, position)
+
+	@override
+	def db_update_all(self):
+		self.db_update()
+		for fieldname in self._table_fieldnames:
+			if fieldname not in self.__dict__:
+				# Not fetched, can't possibly change so no need to update
+				continue
+			for doc in self.get(fieldname):
+				doc.db_update()
+
+	@override
+	def init_child_tables(self):
+		# Avoid initializing anything, descriptor handles it.
+		return
+
+
+class LazyChildTable:
+	__slots__ = ("doctype", "fieldname")
+
+	def __init__(self, fieldname: str, doctype: str) -> None:
+		self.fieldname = fieldname
+		self.doctype = doctype
+
+	def __get__(self, doc: Document, objtype=None):
+		# Note: avoid any high level access here, can cause recursion
+		fieldname = self.fieldname
+		__dict = doc.__dict__
+		assert fieldname not in __dict, "Descriptor should not override existing values"
+		__dict[fieldname] = []
+		children = doc._load_child_table_from_db(fieldname, self.doctype) or []
+		# Update __dict__ and convert to Document objects
+		doc.extend(fieldname, children)
+		return __dict[fieldname]
+
+	# Note: Don't implement __set__ method! https://docs.python.org/3/howto/descriptor.html#descriptor-protocol
+
+
+def copy_doc(doc: "Document", ignore_no_copy: bool = True) -> "Document":
+	"""No_copy fields also get copied."""
+	import copy
+	from types import MappingProxyType
+
+	from frappe.model.base_document import BaseDocument
+
+	def remove_no_copy_fields(d):
+		for df in d.meta.get("fields", {"no_copy": 1}):
+			if hasattr(d, df.fieldname):
+				d.set(df.fieldname, None)
+
+	fields_to_clear = ["name", "owner", "creation", "modified", "modified_by"]
+
+	if not frappe.in_test:
+		fields_to_clear.append("docstatus")
+
+	if isinstance(doc, BaseDocument):
+		d = doc.as_dict()
+	elif isinstance(doc, MappingProxyType):  # global test record
+		d = dict(doc)
+	else:
+		d = doc
+
+	newdoc = get_doc(copy.deepcopy(d))
+	newdoc.set("__islocal", 1)
+	for fieldname in [*fields_to_clear, "amended_from", "amendment_date"]:
+		newdoc.set(fieldname, None)
+
+	if not ignore_no_copy:
+		remove_no_copy_fields(newdoc)
+
+	for d in newdoc.get_all_children():
+		d.set("__islocal", 1)
+
+		for fieldname in fields_to_clear:
+			d.set(fieldname, None)
+
+		if not ignore_no_copy:
+			remove_no_copy_fields(d)
+
+	return newdoc
+
+
+def new_doc(
+	doctype: str,
+	*,
+	parent_doc: "Document" | None = None,
+	parentfield: str | None = None,
+	as_dict: bool = False,
+	**kwargs,
+) -> "Document":
+	"""Return a new document of the given DocType with defaults set.
+
+	:param doctype: DocType of the new document.
+	:param parent_doc: [optional] add to parent document.
+	:param parentfield: [optional] add against this `parentfield`.
+	:param as_dict: [optional] return as dictionary instead of Document.
+	:param kwargs: [optional] You can specify fields as field=value pairs in function call.
+	"""
+
+	from frappe.model.create_new import get_new_doc
+
+	new_doc = get_new_doc(doctype, parent_doc, parentfield, as_dict=as_dict)
+
+	return new_doc.update(kwargs)
+
+
+def get_cached_doc(*args: Any, **kwargs: Any) -> "Document":
+	"""Identical to `frappe.get_doc`, but return from cache if available."""
+	if (key := can_cache_doc(args)) and (doc := frappe.cache.get_value(key)):
+		return doc
+
+	# Not found in cache, fetch from DB
+	doc = get_doc(*args, **kwargs)
+
+	# Store in cache
+	if not key:
+		key = get_document_cache_key(doc.doctype, doc.name)
+
+	_set_document_in_cache(key, doc)
+
+	return doc
+
+
+def _set_document_in_cache(key: str, doc: "Document") -> None:
+	frappe.cache.set_value(key, doc, expires_in_sec=3600)
+
+
+def can_cache_doc(args) -> str | None:
+	"""
+	Determine if document should be cached based on get_doc params.
+	Return cache key if doc can be cached, None otherwise.
+	"""
+
+	if not args:
+		return
+
+	doctype = args[0]
+	name = doctype if len(args) == 1 or args[1] is None else args[1]
+
+	# Only cache if both doctype and name are strings
+	if isinstance(doctype, str) and isinstance(name, str):
+		return get_document_cache_key(doctype, name)
+
+
+def get_document_cache_key(doctype: str, name: str):
+	return f"document_cache::{doctype}::{name}"
+
+
+def clear_document_cache(doctype: str, name: str | None = None) -> None:
+	frappe.db.value_cache.pop(doctype, None)
+
+	def clear_in_redis():
+		if name is not None:
+			frappe.cache.delete_value(get_document_cache_key(doctype, name))
+		else:
+			frappe.cache.delete_keys(get_document_cache_key(doctype, ""))
+
+	clear_in_redis()
+	if hasattr(frappe.db, "after_commit"):
+		frappe.db.after_commit.add(clear_in_redis)
+		frappe.db.after_rollback.add(clear_in_redis)
+
+	if doctype == "System Settings" and hasattr(frappe.local, "system_settings"):
+		delattr(frappe.local, "system_settings")
+
+	if doctype == "Website Settings" and hasattr(frappe.local, "website_settings"):
+		delattr(frappe.local, "website_settings")
+
+
+def get_cached_value(
+	doctype: str, name: str | dict, fieldname: str | Iterable[str] = "name", as_dict: bool = False
+) -> Any:
+	try:
+		doc = get_cached_doc(doctype, name)
+	except frappe.DoesNotExistError:
+		frappe.clear_last_message()
+		return
+
+	if isinstance(fieldname, str):
+		if as_dict:
+			frappe.throw("Cannot make dict for single fieldname")
+		return doc.get(fieldname)
+
+	values = [doc.get(f) for f in fieldname]
+	if as_dict:
+		return frappe._dict(zip(fieldname, values, strict=False))
+	return values
+
+
+def get_single_value(setting: str, fieldname: str, /, *, as_dict: bool = False):
+	"""Return the cached value associated with the given fieldname from single DocType.
+
+	Usage:
+		telemetry_enabled = frappe.get_single_value("System Settings", "telemetry_enabled")
+	"""
+	return get_cached_value(setting, setting, fieldname=fieldname, as_dict=as_dict)
+
+
+def get_last_doc(
+	doctype,
+	filters: FilterSignature | None = None,
+	order_by="creation desc",
+	*,
+	for_update=False,
+):
+	"""Get last created document of this type."""
+	d = frappe.get_all(doctype, filters=filters, limit_page_length=1, order_by=order_by, pluck="name")
+	if d:
+		return get_doc(doctype, d[0], for_update=for_update)
+	else:
+		raise frappe.DoesNotExistError(doctype=doctype)
+
+
+def get_single(doctype):
+	"""Return a `frappe.model.document.Document` object of the given Single doctype."""
+	return get_doc(doctype, doctype)

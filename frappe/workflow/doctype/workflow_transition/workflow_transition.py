@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class WorkflowTransition(Document):
+	_DOCTYPE_NAME = "Workflow Transition"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -24,6 +26,7 @@ class WorkflowTransition(Document):
 		parenttype: DF.Data
 		send_email_to_creator: DF.Check
 		state: DF.Link
+		transition_tasks: DF.Link | None
 		workflow_builder_id: DF.Data | None
 	# end: auto-generated types
 

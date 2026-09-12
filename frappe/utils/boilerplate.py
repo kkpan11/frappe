@@ -147,6 +147,7 @@ def _create_app_boilerplate(dest, hooks, no_git=False):
 	frappe.create_folder(os.path.join(dest, hooks.app_name, hooks.app_name, "config"), with_init=True)
 	frappe.create_folder(os.path.join(dest, hooks.app_name, hooks.app_name, "public", "css"))
 	frappe.create_folder(os.path.join(dest, hooks.app_name, hooks.app_name, "public", "js"))
+	frappe.create_folder(os.path.join(dest, hooks.app_name, hooks.app_name, "patches"), with_init=True)
 
 	# add .gitkeep file so that public folder is committed to git
 	# this is needed because if public doesn't exist, bench build doesn't symlink the apps assets
@@ -341,11 +342,11 @@ authors = [
     {{ name = "{app_publisher}", email = "{app_email}"}}
 ]
 description = "{app_description}"
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 readme = "README.md"
 dynamic = ["version"]
 dependencies = [
-    # "frappe~=15.0.0" # Installed and managed by bench.
+    # "frappe~=16.0.0" # Installed and managed by bench.
 ]
 
 [build-system]
@@ -356,9 +357,13 @@ build-backend = "flit_core.buildapi"
 [tool.bench.dev-dependencies]
 # package_name = "~=1.1.0"
 
+# These apt dependencies will be installed from Ubuntu repositories when you host your app on Frappe Cloud
+[deploy.dependencies.apt]
+packages = []
+
 [tool.ruff]
 line-length = 110
-target-version = "py310"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = [
@@ -387,6 +392,8 @@ ignore = [
     "UP030", # Use implicit references for positional format fields (translations)
     "UP031", # Use format specifiers instead of percent format
     "UP032", # Use f-string instead of `format` call (translations)
+    "UP037", # quoted annotations
+    "UP040", # Use type aliases instead of type annotations
 ]
 typing-modules = ["frappe.types.DF"]
 
@@ -403,6 +410,10 @@ app_description = "{app_description}"
 app_email = "{app_email}"
 app_license = "{app_license}"
 
+# Send non-GET requests for this app's endpoints as native `application/json`
+# bodies instead of form-encoded, per-key JSON-stringified values.
+use_json_request_body = True
+
 # Apps
 # ------------------
 
@@ -415,9 +426,18 @@ app_license = "{app_license}"
 # 		"logo": "/assets/{app_name}/logo.png",
 # 		"title": "{app_title}",
 # 		"route": "/{app_name}",
-# 		"has_permission": "{app_name}.api.permission.has_app_permission"
+# 		"has_permission": "{app_name}.api.permission.has_app_permission",
 # 	}}
 # ]
+
+# The dock, the rail down the left of the desk, is a document rather than a hook. Author it in
+# Manage Dock on a developer-mode site and press Export to App, and it is written to
+# `{app_name}/dock/{app_name}/{app_name}.json` for git to carry. An app that ships none has no
+# rail: its sidebar gets a switcher in the header instead.
+#
+# A companion app, one that extends a host app rather than standing on its own, says so with
+# `mount_on` on that same record, and its entries are appended to the host's rail. Mounting keeps
+# the companion off the apps screen, so it takes precedence over any add_to_apps_screen above.
 
 # Includes in <head>
 # ------------------
@@ -462,6 +482,14 @@ app_license = "{app_license}"
 # 	"Role": "home_page"
 # }}
 
+# Setup Wizard
+# ------------
+
+# open a fresh site's setup in this app's own UI instead of the desk wizard.
+# must be a non-desk route (not under /desk or /app); to customize setup within
+# desk, use setup_wizard_stages / setup_wizard_complete instead.
+# setup_wizard_url = "/{app_name}/setup"
+
 # Generators
 # ----------
 
@@ -492,6 +520,17 @@ app_license = "{app_license}"
 # before_uninstall = "{app_name}.uninstall.before_uninstall"
 # after_uninstall = "{app_name}.uninstall.after_uninstall"
 
+# Disable / Enable
+# ----------------
+# Called when this app is logically disabled or re-enabled on a site,
+# without uninstalling it. Use this to hide/restore fields this app adds
+# to other apps' doctypes.
+
+# before_disable = "{app_name}.uninstall.before_disable"
+# after_disable = "{app_name}.uninstall.after_disable"
+# before_enable = "{app_name}.install.before_enable"
+# after_enable = "{app_name}.install.after_enable"
+
 # Integration Setup
 # ------------------
 # To set up dependencies/integrations with other apps
@@ -508,11 +547,28 @@ app_license = "{app_license}"
 # before_app_uninstall = "{app_name}.utils.before_app_uninstall"
 # after_app_uninstall = "{app_name}.utils.after_app_uninstall"
 
+# Build
+# ------------------
+# To hook into the build process
+
+# after_build = "{app_name}.build.after_build"
+
+# To hook into the build process of other apps
+# The list of apps being built is passed as an argument
+
+# after_app_build = "{app_name}.build.after_app_build"
+
 # Desk Notifications
 # ------------------
 # See frappe.core.notifications.get_notification_config
 
 # notification_config = "{app_name}.notifications.get_notification_config"
+
+# Awesome Bar
+# -----------
+# Extra search results: list of dicts with label, description, route, index.
+# route: ["List", "ToDo"], "/desk/docs/some/page", or "https://example.com"
+# awesomebar_search = ["{app_name}.search.awesomebar_results"]
 
 # Permissions
 # -----------
@@ -564,6 +620,14 @@ app_license = "{app_license}"
 
 # before_tests = "{app_name}.install.before_tests"
 
+# Extend DocType Class
+# ------------------------------
+#
+# Specify custom mixins to extend the standard doctype controller.
+# extend_doctype_class = {{
+# 	"Task": "{app_name}.custom.task.CustomTaskMixin"
+# }}
+
 # Overriding Methods
 # ------------------------------
 #
@@ -597,6 +661,8 @@ app_license = "{app_license}"
 # before_job = ["{app_name}.utils.before_job"]
 # after_job = ["{app_name}.utils.after_job"]
 
+# after_file_upload = ["{app_name}.utils.after_file_upload"]
+
 # User Data Protection
 # --------------------
 
@@ -629,11 +695,19 @@ app_license = "{app_license}"
 # ]
 
 # Automatically update python controller files with type annotations for this app.
-# export_python_type_annotations = True
+export_python_type_annotations = True
+
+# Require all whitelisted methods to have type annotations
+require_type_annotated_api_methods = True
 
 # default_log_clearing_doctypes = {{
 # 	"Logging DocType Name": 30  # days to retain logs
 # }}
+
+# Translation
+# ------------
+# List of apps whose translatable strings should be excluded from this app's translations.
+# ignore_translatable_strings_from = []
 
 """
 
@@ -723,7 +797,7 @@ jobs:
         ports:
           - 11000:6379
       mariadb:
-        image: mariadb:10.6
+        image: mariadb:11.8
         env:
           MYSQL_ROOT_PASSWORD: root
         ports:
@@ -732,7 +806,7 @@ jobs:
 
     steps:
       - name: Clone
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: Find tests
         run: |
@@ -740,14 +814,14 @@ jobs:
           grep -rn "def test" > /dev/null
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.14'
 
       - name: Setup Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v6
         with:
-          node-version: 18
+          node-version: 24
           check-latest: true
 
       - name: Cache pip
@@ -780,8 +854,6 @@ jobs:
         run: |
           pip install frappe-bench
           bench init --skip-redis-config-generation --skip-assets --python "$(which python)" ~/frappe-bench
-          mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
-          mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
 
       - name: Install
         working-directory: /home/runner/frappe-bench
@@ -805,10 +877,14 @@ jobs:
 
 patches_template = """[pre_model_sync]
 # Patches added in this section will be executed before doctypes are migrated
-# Read docs to understand patches: https://frappeframework.com/docs/v14/user/en/database-migrations
+# Read docs to understand patches: https://docs.frappe.io/framework/user/en/database-migrations
 
 [post_model_sync]
-# Patches added in this section will be executed after doctypes are migrated"""
+# Patches added in this section will be executed after doctypes are migrated
+
+[post_fixture_sync]
+# Patches added in this section will be executed after fixtures and customizations
+# (Custom Field, Property Setter, etc) are synced"""
 
 
 precommit_template = """exclude: 'node_modules|.git'
@@ -818,7 +894,7 @@ fail_fast: false
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
         files: "{app_name}.*"
@@ -831,7 +907,7 @@ repos:
       - id: debug-statements
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.1
+    rev: v0.14.10
     hooks:
       - id: ruff
         name: "Run ruff import sorter"
@@ -902,10 +978,10 @@ jobs:
     if: github.event_name == 'pull_request'
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.14'
           cache: pip
       - uses: pre-commit/action@v3.0.0
 
@@ -922,14 +998,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: '3.10'
+          python-version: '3.14'
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/*requirements.txt', '**/pyproject.toml', '**/setup.py') }}

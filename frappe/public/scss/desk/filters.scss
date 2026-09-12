@@ -21,6 +21,15 @@
 		.remove-filter {
 			cursor: pointer;
 			line-height: 2;
+
+			&:focus {
+				outline: none;
+			}
+
+			&:focus-visible .icon {
+				box-shadow: var(--focus-default);
+				border-radius: 4px;
+			}
 		}
 
 		.filter-field {
@@ -51,6 +60,7 @@
 	.filter-action-buttons {
 		display: flex;
 		justify-content: space-between;
+		margin-bottom: 0.5rem;
 
 		.add-filter {
 			cursor: pointer;
@@ -58,10 +68,15 @@
 
 		.btn {
 			box-shadow: none;
+
+			&:focus-visible {
+				box-shadow: var(--focus-default) !important;
+			}
 		}
 	}
 
 	.divider {
+		margin: 15px 0;
 		background-color: var(--border-color);
 	}
 }
@@ -104,4 +119,26 @@
 			}
 		}
 	}
+}
+
+.input-group > .form-control:not(:last-child) {
+	border-top-right-radius: 0 !important;
+	border-bottom-right-radius: 0 !important;
+	margin-right: 0px !important;
+}
+
+.match-type-dropdown-btn {
+	border-top-left-radius: 0 !important;
+	border-bottom-left-radius: 0 !important;
+	height: var(--btn-height);
+	border-left: 1px solid var(--btn-group-border-color);
+	display: flex;
+	align-items: center;
+
+	&:focus {
+		box-shadow: none !important;
+	}
+}
+.match-type-dropdown-menu {
+	min-width: 100px;
 }

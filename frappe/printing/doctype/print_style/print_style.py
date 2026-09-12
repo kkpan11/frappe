@@ -6,6 +6,8 @@ from frappe.model.document import Document
 
 
 class PrintStyle(Document):
+	_DOCTYPE_NAME = "Print Style"
+
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -26,7 +28,7 @@ class PrintStyle(Document):
 			self.standard == 1
 			and not frappe.local.conf.get("developer_mode")
 			and not frappe.flags.in_import
-			and not frappe.flags.in_test
+			and not frappe.in_test
 		):
 			frappe.throw(frappe._("Standard Print Style cannot be changed. Please duplicate to edit."))
 

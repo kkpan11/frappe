@@ -3,6 +3,8 @@
 
 import frappe
 
+EXPORTED_REPORT_FOLDER_PATH = "Home/Exported Reports"
+
 
 def validate_route_conflict(doctype, name):
 	"""
@@ -15,7 +17,11 @@ def validate_route_conflict(doctype, name):
 	all_names = []
 	for _doctype in ["Page", "Workspace", "DocType"]:
 		all_names.extend(
-			[slug(d) for d in frappe.get_all(_doctype, pluck="name") if (doctype != _doctype and d != name)]
+			[
+				slug(d)
+				for d in frappe.get_all(_doctype, pluck="name")
+				if not (doctype == _doctype and d == name)
+			]
 		)
 
 	if slug(name) in all_names:
@@ -25,6 +31,45 @@ def validate_route_conflict(doctype, name):
 
 def slug(name):
 	return name.lower().replace(" ", "-")
+
+
+def is_item_allowed(name, item_type, ctx):
+	"""Return whether the user may see a sidebar/workspace item.
+
+	`ctx` is any object exposing the per-user view-permission caches (`can_read`,
+	`allowed_pages`, `allowed_reports`, `allowed_dashboards`, `allowed_workspaces`,
+	`restricted_doctypes`, `restricted_pages`) — in practice a
+	`frappe.desk.desk_views.DeskViews` instance.
+	"""
+	if frappe.session.user == "Administrator":
+		return True
+
+	item_type = item_type.lower()
+
+	if item_type == "doctype":
+		try:
+			return (
+				name in (ctx.can_read or [])
+				and name in (ctx.restricted_doctypes or [])
+				and frappe.has_permission(name)
+			)
+		except frappe.DoesNotExistError:
+			frappe.clear_last_message()
+			return False
+	if item_type == "page":
+		# `restricted_pages` is None while a patch, install or migrate is running, the same as
+		# `restricted_doctypes` above, so it is coalesced rather than iterated blindly.
+		return name in (ctx.allowed_pages or {}) and name in (ctx.restricted_pages or [])
+	if item_type == "report":
+		return not frappe.db.get_value("Report", name, "disabled", cache=True) and name in ctx.allowed_reports
+	if item_type == "dashboard":
+		return name in (ctx.allowed_dashboards or [])
+	if item_type in ("help", "url"):
+		return True
+	if item_type == "workspace":
+		return name in (ctx.allowed_workspaces or [])
+
+	return False
 
 
 def pop_csv_params(form_dict):
@@ -45,11 +90,13 @@ def get_csv_bytes(data: list[list], csv_params: dict) -> bytes:
 	from csv import writer
 	from io import StringIO
 
+	from frappe.utils.csvutils import escape_formula_injection
+
 	decimal_sep = csv_params.pop("decimal_sep", None)
 
-	_data = data.copy()
+	_data = [[escape_formula_injection(v) for v in row] for row in data]
 	if decimal_sep:
-		_data = apply_csv_decimal_sep(data, decimal_sep)
+		_data = apply_csv_decimal_sep(_data, decimal_sep)
 
 	file = StringIO()
 	csv_writer = writer(file, **csv_params)
@@ -76,3 +123,71 @@ def provide_binary_file(filename: str, extension: str, content: bytes) -> None:
 	frappe.response["type"] = "binary"
 	frappe.response["filecontent"] = content
 	frappe.response["filename"] = f"{_(filename)}.{extension}"
+
+
+def send_report_email(
+	user_email: str, report_name: str, file_extension: str, content: bytes, attached_to_name: str
+):
+	create_exported_report_folder_if_not_exists()
+	_file = frappe.get_doc(
+		{
+			"doctype": "File",
+			"file_name": f"{report_name}.{file_extension}",
+			"attached_to_doctype": "Report",
+			"attached_to_name": attached_to_name,
+			"content": content,
+			"is_private": 1,
+			"folder": EXPORTED_REPORT_FOLDER_PATH,
+		}
+	)
+	_file.save(ignore_permissions=True)
+
+	file_url = frappe.utils.get_url(_file.get_url())
+	file_retention_hours = frappe.get_system_settings("delete_background_exported_reports_after") or 48
+
+	frappe.sendmail(
+		recipients=[user_email],
+		subject=frappe._("Your exported report: {0}").format(report_name),
+		message=frappe._(
+			"The report you requested has been generated.<br><br>"
+			"Click here to download:<br>"
+			"<a href='{0}'>{0}</a><br><br>"
+			"This link will expire in {1} hours."
+		).format(file_url, file_retention_hours),
+		now=True,
+	)
+
+
+def delete_old_exported_report_files():
+	file_retention_hours = frappe.get_system_settings("delete_background_exported_reports_after") or 48
+
+	cutoff = frappe.utils.add_to_date(frappe.utils.now_datetime(), hours=-file_retention_hours)
+	old_files = frappe.get_all(
+		"File",
+		filters={
+			"attached_to_doctype": "Report",
+			"creation": ("<", cutoff),
+			"folder": EXPORTED_REPORT_FOLDER_PATH,
+		},
+		pluck="name",
+	)
+
+	for file_name in old_files:
+		try:
+			frappe.delete_doc("File", file_name)
+		except Exception:
+			frappe.log_error(f"Failed to delete old report file {file_name}")
+
+
+def create_exported_report_folder_if_not_exists():
+	parent_folder, folder_name = EXPORTED_REPORT_FOLDER_PATH.split("/")
+	folder = frappe.get_doc(
+		{
+			"doctype": "File",
+			"file_name": folder_name,
+			"is_folder": 1,
+			"folder": parent_folder,
+			"is_private": 1,
+		}
+	)
+	folder.insert(ignore_permissions=True, ignore_if_duplicate=True)

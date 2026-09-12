@@ -41,7 +41,7 @@ def get_public_pages_from_doctypes():
 	doctypes_with_web_view = get_doctypes_with_web_view()
 
 	robot_parser_instance = None
-	if robots_txt := frappe.db.get_single_value("Website Settings", "robots_txt"):
+	if robots_txt := frappe.get_single_value("Website Settings", "robots_txt"):
 		robot_parser_instance = robotparser.RobotFileParser()
 		robot_parser_instance.parse(robots_txt.splitlines())
 
@@ -68,6 +68,9 @@ def get_public_pages_from_doctypes():
 				raise e
 
 		for r in res:
+			if not r.route or is_dynamic_route(r.route):
+				continue
+
 			if robot_parser_instance and not robot_parser_instance.can_fetch("*", f"/{r.route}"):
 				continue
 
@@ -78,3 +81,8 @@ def get_public_pages_from_doctypes():
 			}
 
 	return routes
+
+
+def is_dynamic_route(route: str) -> bool:
+	"""Check if route has dynamic segments like /project/<name> or /blog/:name."""
+	return "<" in route or any(part.startswith(":") for part in route.split("/"))

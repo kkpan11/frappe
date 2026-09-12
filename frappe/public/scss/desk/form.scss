@@ -6,7 +6,7 @@
 	left: 0;
 	z-index: 1050;
 	padding: 2px 6px;
-	border-radius: var(--border-radius-sm);
+	border-radius: var(--radius);
 	background-color: var(--bg-dark-gray);
 	color: var(--text-dark);
 	font-size: var(--text-xs);
@@ -29,6 +29,8 @@
 
 .form-section,
 .form-dashboard-section {
+	padding: 0 var(--padding-md);
+
 	.form-section-description {
 		max-width: var(--page-max-width);
 		margin: auto;
@@ -39,17 +41,24 @@
 
 	.section-head {
 		@extend .head-title;
-		@include get_textstyle("lg", "semibold");
+		@include get_textstyle("md", "medium");
 		color: var(--text-color);
 		width: 100%;
-		padding: var(--padding-sm) var(--padding-md);
+		padding: var(--padding-md);
 		cursor: default;
 
 		.collapse-indicator {
 			color: var(--text-muted);
-			margin-left: 10px;
 			position: relative;
 			padding: 0px;
+
+			&:focus-visible {
+				outline: 1px solid #c9c9c9;
+			}
+		}
+
+		&:focus-visible {
+			outline: 1px solid #c9c9c9;
 		}
 	}
 
@@ -73,10 +82,21 @@
 	}
 }
 
-.section-head,
-.section-body {
-	max-width: var(--page-max-width);
-	margin: auto !important;
+body.full-width {
+	.form-section-description {
+		margin-left: 0;
+	}
+}
+
+.std-form-layout {
+	.section-head,
+	.section-body {
+		margin: auto !important;
+
+		body:not(.full-width) & {
+			max-width: var(--page-max-width);
+		}
+	}
 }
 
 #doctype-form_builder_tab .section-body {
@@ -110,17 +130,26 @@
 .form-section.card-section,
 .form-dashboard-section {
 	border-bottom: 1px solid var(--border-color);
-	padding: var(--padding-md) 0;
 }
 
 .form-section.card-section.hide-border {
 	border-bottom: none;
+	padding-bottom: 0;
+
+	&:not(:has(.section-head)) {
+		padding-top: 0;
+	}
+}
+
+.form-section > .section-body:first-child {
+	padding-top: 12px;
 }
 
 .form-dashboard-section {
 	.section-body:first-child {
 		margin-top: 0;
 	}
+
 	.section-body {
 		display: block;
 		padding: var(--padding-md);
@@ -151,13 +180,17 @@
 .comment-box {
 	margin-top: var(--margin-lg);
 	padding: 0;
+
 	.comment-input-header {
 		display: flex;
 		justify-content: space-between;
 
 		.comment-title {
 			@extend .head-title;
+			font-size: 16px;
+			font-weight: 500;
 		}
+
 		.comment-count {
 			margin-left: 5px;
 			color: var(--text-light);
@@ -170,14 +203,19 @@
 
 		margin-bottom: var(--margin-sm);
 	}
+
 	.comment-input-container {
 		display: flex;
+
 		.avatar {
 			height: 32px;
 			width: 32px;
+			margin-top: 1px;
 		}
+
 		.frappe-control {
 			padding-right: 0;
+
 			.ql-editor {
 				background-color: var(--control-bg) !important;
 				border: 1px solid var(--border-color);
@@ -212,7 +250,7 @@
 	.document-link {
 		margin-bottom: var(--margin-sm);
 		border: 1px solid var(--border-color);
-		border-radius: var(--border-radius);
+		border-radius: var(--radius);
 		background-color: var(--neutral);
 
 		display: flex;
@@ -229,20 +267,23 @@
 		.report-link-badge {
 			@include get_textstyle("sm", "regular");
 			padding: var(--padding-xs) var(--padding-sm);
+
 			.count {
 				font-size: var(--text-xs);
 				font-weight: var(--weight-regular);
 				background-color: var(--subtle-fg);
-				border-radius: var(--border-radius-full);
+				border-radius: var(--radius-full);
 				color: var(--text-color);
 				padding: 0 var(--padding-xs);
 				margin-right: var(--margin-xs);
 			}
+
 			.badge-link:hover:not([disabled="disabled"]),
 			.report-link:hover:not([disabled="disabled"]) {
 				text-decoration: underline;
 			}
 		}
+
 		.open-notification {
 			display: inline-flex;
 			align-items: center;
@@ -250,13 +291,15 @@
 			font-size: var(--text-xs);
 			padding: 0 var(--padding-sm);
 			color: var(--text-color);
-			border-radius: var(--border-radius);
+			border-radius: var(--radius);
 			cursor: pointer;
 		}
+
 		.btn-new,
 		.open-notification {
 			margin-left: var(--margin-sm);
 		}
+
 		.btn-new {
 			box-shadow: none;
 			min-width: 24px;
@@ -284,12 +327,14 @@
 			padding: 0px 5px;
 			text-align: left;
 		}
+
 		.inline-graph-bar {
 			position: absolute;
 			left: 0;
 			right: 0;
 			top: 20px;
 		}
+
 		.inline-graph-bar-inner {
 			display: block;
 			float: left;
@@ -297,10 +342,12 @@
 			height: 6px;
 			border-radius: 0px 3px 3px 0px;
 		}
+
 		.inline-graph-bar-inner.dark {
-			background-color: var(--primary-color);
+			background-color: var(--text-color);
 		}
 	}
+
 	.inline-graph-half:first-child {
 		border-right: 1px solid var(--border-color);
 		margin-right: -3px;
@@ -320,10 +367,12 @@
 	direction: ltr;
 	display: block;
 	transform: scaleX(-1);
+
 	.inline-graph-count {
 		transform: scaleX(-1);
 		text-align: right;
 	}
+
 	.inline-graph-half:first-child .inline-graph-count {
 		text-align: left;
 	}
@@ -335,6 +384,7 @@
 		color: var(--#{$color}-800);
 		background: var(--#{$color}-100);
 	}
+
 	@if $theme == "dark" {
 		border: 1px solid var(--#{$color}-700);
 		color: var(--#{$color}-100);
@@ -376,6 +426,7 @@
 		cursor: pointer;
 	}
 }
+
 [data-theme="dark"] .form-message {
 	&.blue {
 		@include form-message-background("blue", "dark");
@@ -402,6 +453,7 @@
 	margin-top: 4px;
 	margin-bottom: 8px;
 	line-height: 1.6;
+	word-break: break-word;
 }
 
 .form-heatmap {
@@ -428,50 +480,56 @@
 	&.frappe-control:last-child {
 		margin-bottom: 0.5rem;
 	}
+
 	&:last-child.frappe-control[data-fieldtype="Table"] {
 		margin-bottom: 0.5rem;
 	}
 }
 
-// above mobile
-@media (min-width: map-get($grid-breakpoints, "md")) {
-	// for 1, 2 column layouts, implement horizontal, else vertical
-	.col-sm-12 > form > .frappe-control > .horizontal,
-	.col-sm-6 > form > .frappe-control > .horizontal {
-		display: flex;
-		justify-content: space-between;
-		vertical-align: middle;
-
-		.clearfix {
-			width: 38%;
-		}
-
-		.control-input-wrapper {
-			width: 62%; // golden ratio
-		}
-
-		.control-label {
-			margin-top: 3px;
-			margin-bottom: 3px;
-		}
-	}
-}
-
 .form-footer {
-	max-width: var(--page-max-width);
+	body:not(.full-width) & {
+		max-width: var(--page-max-width);
+	}
+
 	margin: auto;
 	padding: 0 15px;
+	position: relative;
+	display: flex;
+	align-items: flex-end;
+	gap: 15px;
 
 	h5 {
 		margin: 15px 0px;
 		font-weight: bold;
 	}
-	position: relative;
+
+	.after-save {
+		flex: 1;
+		min-width: 0;
+	}
+
 	.scroll-to-top {
 		position: absolute;
-		height: 28px;
 		right: 15px;
 		bottom: 15px;
+		height: 28px;
+		flex-shrink: 0;
+		opacity: 0;
+		visibility: hidden;
+		transform: translateY(10px);
+		transition: opacity 0.3s ease, visibility 0.3s ease, transform 0.3s ease;
+		pointer-events: none;
+
+		&.show {
+			position: fixed;
+			right: calc(var(--form-sidebar-width, 277px) + 20px);
+			bottom: 20px;
+			z-index: 1030;
+			opacity: 1;
+			visibility: visible;
+			transform: translateY(0);
+			pointer-events: auto;
+		}
 	}
 }
 
@@ -481,7 +539,7 @@
 	z-index: 5;
 	transition: 0.5s top;
 	border-bottom: 1px solid var(--border-color);
-	border-radius: var(--border-radius-md) var(--border-radius-md) 0 0;
+	border-radius: var(--radius-md) var(--radius-md) 0 0;
 
 	.form-tabs {
 		flex-wrap: nowrap;
@@ -491,30 +549,48 @@
 		.nav-item {
 			white-space: nowrap;
 			@include get_textstyle("base", "regular");
+
 			.nav-link {
-				color: var(--text-muted);
+				color: var(--text-light);
 				padding: 10px 0;
 				margin: 0 var(--margin-md);
+				background-color: var(--card-bg);
+				border: 0;
+				display: flex;
+				align-items: center;
+				gap: 6px;
 
 				&.active {
-					font-weight: 600;
-					border-bottom: 1px solid var(--primary);
-					color: var(--text-color);
+					font-weight: 400;
+					border-bottom: 1px solid var(--text-color);
+					color: var(--text-neutral);
 					padding-bottom: 9px;
+				}
+
+				&:focus-visible {
+					outline: none;
+					font-weight: 600;
 				}
 			}
 		}
 	}
 }
+
 .form-tab-content {
 	scroll-margin-top: calc(var(--navbar-height) + 52px);
 	margin-top: var(--margin-sm);
 }
+
 .form-tabs-sticky-up {
-	top: calc(var(--navbar-height) - 1px);
+	top: calc(var(--navbar-height));
 }
+
 .form-tabs-sticky-down {
-	top: calc(var(--navbar-height) + var(--page-head-height) - 1px);
+	top: calc(var(--navbar-height));
+
+	&.show-navbar {
+		top: calc(var(--navbar-height) + var(--page-head-height) - 1px);
+	}
 }
 
 .progress-area {
@@ -575,14 +651,7 @@
 	}
 }
 
-// mobile
-@media (max-width: map-get($grid-breakpoints, "sm")) {
-	// padding to form section on mobile
-
-	.form-column:not(:last-child) {
-		border-bottom: 1px solid var(--border-color);
-	}
-	.form-column:not(:first-child) {
-		padding-top: var(--padding-md);
-	}
+.popover-header {
+	background: var(--bg-color);
+	color: var(--ink-gray-9);
 }

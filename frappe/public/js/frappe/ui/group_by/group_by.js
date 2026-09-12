@@ -189,7 +189,7 @@ frappe.ui.GroupBy = class {
 
 	apply_settings(settings) {
 		let get_fieldname = (name) => name.split(".")[1].replace(/`/g, "");
-		let get_doctype = (name) => name.split(".")[0].replace(/`/g, "").replace("tab", "");
+		let get_doctype = (name) => name.split(".")[0].replace(/`/g, "").replace(/^tab/, "");
 
 		if (!settings.group_by.startsWith("`tab")) {
 			settings.group_by = "`tab" + this.doctype + "`.`" + settings.group_by + "`";
@@ -230,7 +230,7 @@ frappe.ui.GroupBy = class {
 			$(`<div class="group-by-selector">
 				<button class="btn btn-default btn-sm group-by-button ellipsis">
 					<span class="group-by-icon button-icon">
-						${frappe.utils.icon("es-line-folder-alt")}
+						${frappe.utils.icon("folder")}
 					</span>
 					<span class="button-label hidden-xs">
 						${__("Add Group")}
@@ -243,6 +243,18 @@ frappe.ui.GroupBy = class {
 	}
 
 	apply_group_by() {
+		if (
+			this.group_by_doctype &&
+			this.aggregate_on_doctype &&
+			this.aggregate_on_doctype != this.doctype &&
+			this.group_by_doctype != this.aggregate_on_doctype
+		) {
+			frappe.msgprint(
+				__("Parent-to-child or child-to-different-child grouping is not allowed.")
+			);
+			return false;
+		}
+
 		this.group_by = "`tab" + this.group_by_doctype + "`.`" + this.group_by_field + "`";
 
 		if (this.aggregate_function === "count") {
@@ -374,17 +386,18 @@ frappe.ui.GroupBy = class {
 
 		const fields = this.report_view.meta.fields
 			.concat(standard_fields)
-			.filter((f) =>
-				[
-					"Select",
-					"Link",
-					"Data",
-					"Int",
-					"Check",
-					"Dynamic Link",
-					"Autocomplete",
-					"Date",
-				].includes(f.fieldtype)
+			.filter(
+				(f) =>
+					[
+						"Select",
+						"Link",
+						"Data",
+						"Int",
+						"Check",
+						"Dynamic Link",
+						"Autocomplete",
+						"Date",
+					].includes(f.fieldtype) && !f.is_virtual
 			);
 		this.group_by_fields[this.doctype] = fields.sort((a, b) =>
 			__(cstr(a.label)).localeCompare(cstr(__(b.label)))
@@ -392,7 +405,9 @@ frappe.ui.GroupBy = class {
 		this.all_fields[this.doctype] = this.report_view.meta.fields;
 
 		const standard_fields_filter = (df) =>
-			!frappe.model.no_value_type.includes(df.fieldtype) && !df.report_hide;
+			!frappe.model.no_value_type.includes(df.fieldtype) &&
+			!df.report_hide &&
+			!df.is_virtual;
 
 		const table_fields = frappe.meta.get_table_fields(this.doctype).filter((df) => !df.hidden);
 
@@ -416,7 +431,9 @@ frappe.ui.GroupBy = class {
 					this.get_group_by_field_label(),
 			  ])
 			: __("Add Group");
-
+		if (group_by_applied) {
+			this.group_by_button.find(".button-label").css("gap", "4px");
+		}
 		this.group_by_button
 			.toggleClass("btn-default", !group_by_applied)
 			.toggleClass("btn-primary-light", group_by_applied);

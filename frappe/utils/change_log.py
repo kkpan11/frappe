@@ -10,7 +10,7 @@ from semantic_version import SimpleSpec, Version
 
 import frappe
 from frappe import _, safe_decode
-from frappe.utils import cstr
+from frappe.utils import cint, cstr
 from frappe.utils.caching import redis_cache
 from frappe.utils.frappecloud import on_frappecloud
 
@@ -18,6 +18,9 @@ from frappe.utils.frappecloud import on_frappecloud
 def get_change_log(user=None):
 	if not user:
 		user = frappe.session.user
+
+	if not frappe.is_setup_complete():
+		return []
 
 	last_known_versions = frappe._dict(
 		json.loads(frappe.db.get_value("User", user, "last_known_versions") or "{}")
@@ -88,18 +91,21 @@ def get_change_log_for_app(app, from_version, to_version):
 
 @frappe.whitelist()
 def update_last_known_versions():
-	frappe.db.set_value(
-		"User",
-		frappe.session.user,
-		"last_known_versions",
-		json.dumps(get_versions()),
-		update_modified=False,
-	)
+	with suppress(frappe.QueryDeadlockError):
+		frappe.db.set_value(
+			"User",
+			frappe.session.user,
+			"last_known_versions",
+			json.dumps(get_versions()),
+			update_modified=False,
+		)
 
 
 @frappe.whitelist()
-def get_versions():
-	"""Get versions of all installed apps.
+def get_versions(include_disabled: bool = False):
+	"""Get versions of apps active on this site.
+
+	:param include_disabled: Also return apps that are installed but disabled.
 
 	Example:
 
@@ -110,12 +116,29 @@ def get_versions():
 	                }
 	        }"""
 	versions = {}
-	for app in frappe.get_installed_apps(_ensure_on_bench=True):
+	apps = (
+		frappe.get_installed_apps(_ensure_on_bench=True)
+		if cint(include_disabled)
+		else frappe.get_active_apps(_ensure_on_bench=True)
+	)
+	for app in apps:
 		app_hooks = frappe.get_hooks(app_name=app)
+		app_color = app_hooks.get("app_color")
+
+		# Prefer add_to_apps_screen logo, then app_logo_url — no frappe fallback
+		logo = None
+		apps_screen = app_hooks.get("add_to_apps_screen")
+		if apps_screen and apps_screen[0].get("logo"):
+			logo = apps_screen[0]["logo"]
+		elif app_hooks.get("app_logo_url"):
+			logo = app_hooks["app_logo_url"][0]
+
 		versions[app] = {
 			"title": app_hooks.get("app_title")[0],
 			"description": app_hooks.get("app_description")[0],
 			"branch": get_app_branch(app),
+			"color": app_color[0] if app_color else None,
+			"logo": logo,
 		}
 
 		if versions[app]["branch"] != "master":
@@ -136,8 +159,8 @@ def get_app_branch(app):
 	try:
 		with open(os.devnull, "wb") as null_stream:
 			result = subprocess.check_output(
-				f"cd ../apps/{app} && git rev-parse --abbrev-ref HEAD",
-				shell=True,
+				["git", "-C", f"../apps/{app}", "rev-parse", "--abbrev-ref", "HEAD"],
+				shell=False,
 				stdin=null_stream,
 				stderr=null_stream,
 			)
@@ -152,8 +175,8 @@ def get_app_last_commit_ref(app):
 	try:
 		with open(os.devnull, "wb") as null_stream:
 			result = subprocess.check_output(
-				f"git -C ../apps/{app} rev-parse --short=7 HEAD",
-				shell=True,
+				["git", "-C", f"../apps/{app}", "rev-parse", "--short=7", "HEAD"],
+				shell=False,
 				stdin=null_stream,
 				stderr=null_stream,
 			)
@@ -165,7 +188,7 @@ def get_app_last_commit_ref(app):
 
 
 def check_for_update():
-	if frappe.get_system_settings("disable_system_update_notification"):
+	if frappe.get_system_settings("disable_system_update_notification") or not frappe.is_setup_complete():
 		return
 
 	updates = frappe._dict(major=[], minor=[], patch=[])
@@ -394,7 +417,7 @@ def show_update_popup():
 
 
 def get_pyproject(app: str) -> dict | None:
-	from tomli import load
+	from tomllib import load
 
 	pyproject_path = frappe.get_app_path(app, "..", "pyproject.toml")
 
